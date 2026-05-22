@@ -87,11 +87,12 @@ if (Get-Command Get-NinjaProperty -ErrorAction SilentlyContinue) {
         Write-Log "Could not read 'minutesToAutoLogoff' from NinjaOne: $($_.Exception.Message)" "Warning"
     }
 
-    # false = unchecked (remove task); null (never touched) returns null or throws - both ignored
+    # 0/"0"/$false/"false" = unchecked (remove task); null or throws = not configured, ignored
+    # Get-NinjaProperty returns checkbox values as string "0"/"1", not boolean.
     try {
         $v = Get-NinjaProperty -Name "autoLogoffInactiveUsers" -ErrorAction Stop
         Write-Log "NinjaOne: autoLogoffInactiveUsers = $v"
-        if ($v -eq $false -or $v -eq 'false') { $IdleMinutes = 0 }
+        if ($v -eq $false -or $v -eq 'false' -or $v -eq '0') { $IdleMinutes = 0 }
     } catch {
         Write-Log "Could not read 'autoLogoffInactiveUsers' from NinjaOne: $($_.Exception.Message)" "Warning"
     }

@@ -4,6 +4,15 @@ All notable changes to this repository are documented here. Entries are grouped 
 
 ---
 
+## 2026-05-22
+
+### Windows - Configure Auto Logoff (fix)
+- Fixed `autoLogoffInactiveUsers` checkbox not triggering task removal when unchecked
+- Root cause: `Get-NinjaProperty` returns checkbox values as string `"0"`/`"1"`, not boolean. The removal condition only tested for `$false` and `"false"`, missing the `"0"` case
+- Added `$v -eq '0'` to the removal condition
+
+---
+
 ## 2026-05-20
 
 ### Windows - Configure Auto Logoff (new)
