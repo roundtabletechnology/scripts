@@ -426,6 +426,16 @@ shutdown /a           # Abort a pending shutdown
 shutdown /r /t 60 /c "Rebooting for updates"  # Reboot in 60 seconds with message
 ```
 
+**Unexpected Reboots**
+
+Event ID 41 (Kernel-Power) and 6008 both indicate the system rebooted without a clean shutdown (crash, hard reset, or power loss).
+
+```powershell
+Get-WinEvent -FilterHashtable @{LogName='System'; Id=41,6008} -MaxEvents 20 |
+    Select-Object TimeCreated, Id, @{N='Summary';E={$_.Message -split "`n" | Select-Object -First 1}} |
+    Format-Table -AutoSize
+```
+
 ## Services
 ```powershell
 # Get-Service cmdlet
