@@ -129,6 +129,23 @@ function Uninstall-NinjaMSI {
     Start-Sleep 30
 }
 
+# Registers a one-time Scheduled Task to install the new agent under SYSTEM.
+# Used as a safety net in case this script's process is terminated by the MSI
+# uninstaller - NinjaOne's scripting engine runs inside the Ninja process tree,
+# and that entire tree is torn down when the agent is removed. The task fires
+# after the specified delay and deletes itself automatically after running.
+function Register-InstallTask {
+    param ([string]$URL)
+    $TaskName  = 'NinjaRMM-NewAgentInstall'
+    $Action    = New-ScheduledTaskAction -Execute 'msiexec.exe' -Argument "/i `"$URL`" /quiet /norestart"
+    $Trigger   = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5)
+    $Settings  = New-ScheduledTaskSettingsSet -DeleteExpiredTaskAfter (New-TimeSpan -Minutes 15) -ExecutionTimeLimit (New-TimeSpan -Minutes 15)
+    $Principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+    Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Settings $Settings -Principal $Principal -Force -ErrorAction Stop | Out-Null
+    Write-Log "Safety-net install task registered - fires at $((Get-Date).AddMinutes(5).ToString('HH:mm:ss')) if this process is terminated."
+}
+
 # Removes Ninja Remote (ncstreamer) registry entries from a specific user profile hive.
 # Ninja Remote writes autostart entries to the user's Run key and stores settings under
 # "NinjaRMM LLC". This must be cleaned from every user profile - both currently loaded
@@ -172,6 +189,10 @@ try {
         $NinjaRegPath     = 'HKLM:\SOFTWARE\NinjaRMM LLC\NinjaRMMAgent'
         $UninstallRegPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
     }
+
+    # Register the install task before touching the agent so it fires even if
+    # the uninstaller kills this process.
+    Register-InstallTask -URL $InstallerURL
 
     Write-Log 'Beginning NinjaRMM agent removal...'
 
@@ -325,22 +346,26 @@ try {
     # same issue and we do not want to damage unrelated software.
     # The hardcoded GUID (99E80CA9...) is a known Windows common component that
     # legitimately has no ProductName and must be excluded to avoid a false positive.
-    $Child      = Get-ChildItem 'HKLM:\Software\Classes\Installer\Products' -ErrorAction SilentlyContinue
-    $MissingPNs = [System.Collections.Generic.List[object]]::new()
+    # This check is purely informational - failures here must not abort the install.
+    try {
+        $Child      = Get-ChildItem 'HKLM:\Software\Classes\Installer\Products' -ErrorAction SilentlyContinue
+        $MissingPNs = [System.Collections.Generic.List[object]]::new()
 
-    foreach ($C in $Child) {
-        if ($C.Name -match '99E80CA9B0328e74791254777B1F42AE') { continue }
-        try {
-            Get-ItemPropertyValue $C.PSPath -Name 'ProductName' -ErrorAction Stop | Out-Null
-        } catch {
-            $MissingPNs.Add($C.Name)
+        foreach ($C in $Child) {
+            if ($C.PSChildName -match '99E80CA9B0328e74791254777B1F42AE') { continue }
+            $ProductName = Get-ItemPropertyValue $C.PSPath -Name 'ProductName' -ErrorAction SilentlyContinue
+            if ($null -eq $ProductName) {
+                $MissingPNs.Add($C.PSChildName)
+            }
         }
-    }
 
-    if ($MissingPNs) {
-        Write-Log 'Some installer registry keys are missing a ProductName - possible corrupt Ninja install entry.' -Level Warning
-        Write-Log 'Back up and manually review these keys if the agent install fails:' -Level Warning
-        $MissingPNs | ForEach-Object { Write-Log "  $_" -Level Warning }
+        if ($MissingPNs) {
+            Write-Log 'Some installer registry keys are missing a ProductName - possible corrupt Ninja install entry.' -Level Warning
+            Write-Log 'Back up and manually review these keys if the agent install fails:' -Level Warning
+            $MissingPNs | ForEach-Object { Write-Log "  $_" -Level Warning }
+        }
+    } catch {
+        Write-Log "Orphaned key check failed (non-fatal): $($_.Exception.Message)" -Level Warning
     }
 
     # --- Remove Ninja Remote ---
@@ -456,6 +481,9 @@ try {
     Write-Log 'NinjaRMM agent removal complete. Review output above for any warnings.'
 
     # --- Install new MSP NinjaRMM agent ---
+    # Unregister the safety-net task - the script survived and will handle the
+    # install directly so we can capture the exit code and log the result.
+    Unregister-ScheduledTask -TaskName 'NinjaRMM-NewAgentInstall' -Confirm:$false -ErrorAction SilentlyContinue
     Write-Log "Installing new MSP NinjaRMM agent from: $InstallerURL"
     $InstallResult = Start-Process 'msiexec.exe' -ArgumentList "/i `"$InstallerURL`" /quiet /norestart" -Wait -PassThru -NoNewWindow
     if ($InstallResult.ExitCode -ne 0) {
