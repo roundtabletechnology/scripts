@@ -139,7 +139,7 @@ function Register-InstallTask {
     $TaskName  = 'NinjaRMM-NewAgentInstall'
     $Action    = New-ScheduledTaskAction -Execute 'msiexec.exe' -Argument "/i `"$URL`" /quiet /norestart"
     $Trigger   = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5)
-    $Settings  = New-ScheduledTaskSettingsSet -DeleteExpiredTaskAfter (New-TimeSpan -Minutes 15) -ExecutionTimeLimit (New-TimeSpan -Minutes 15)
+    $Settings  = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 15)
     $Principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
     Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Settings $Settings -Principal $Principal -Force -ErrorAction Stop | Out-Null
