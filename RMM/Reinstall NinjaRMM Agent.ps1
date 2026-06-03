@@ -136,8 +136,21 @@ function Uninstall-NinjaMSI {
 # after the specified delay and deletes itself automatically after running.
 function Register-InstallTask {
     param ([string]$URL)
-    $TaskName  = 'NinjaRMM-NewAgentInstall'
-    $Action    = New-ScheduledTaskAction -Execute 'msiexec.exe' -Argument "/i `"$URL`" /quiet /norestart"
+    $TaskName      = 'NinjaRMM-NewAgentInstall'
+    $InstallerPath = "$env:windir\Temp\NinjaAgentInstall.msi"
+    # The task runs PowerShell to download the MSI first, then installs from a local path.
+    # msiexec as SYSTEM cannot reliably fetch URLs directly - the SYSTEM account uses
+    # WinHTTP, which does not inherit user-context proxy or authentication settings.
+    # .NET's WebClient resolves this correctly.
+    $Script = @"
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+`$f = '$InstallerPath'
+(New-Object Net.WebClient).DownloadFile('$URL', `$f)
+Start-Process msiexec.exe -ArgumentList @('/i', `$f, '/quiet', '/norestart') -Wait -NoNewWindow
+Remove-Item `$f -Force -ErrorAction SilentlyContinue
+"@
+    $Encoded   = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($Script))
+    $Action    = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-ExecutionPolicy Bypass -NonInteractive -EncodedCommand $Encoded"
     $Trigger   = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5)
     $Settings  = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 15)
     $Principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
@@ -484,8 +497,13 @@ try {
     # Unregister the safety-net task - the script survived and will handle the
     # install directly so we can capture the exit code and log the result.
     Unregister-ScheduledTask -TaskName 'NinjaRMM-NewAgentInstall' -Confirm:$false -ErrorAction SilentlyContinue
-    Write-Log "Installing new MSP NinjaRMM agent from: $InstallerURL"
-    $InstallResult = Start-Process 'msiexec.exe' -ArgumentList "/i `"$InstallerURL`" /quiet /norestart" -Wait -PassThru -NoNewWindow
+    $InstallerPath = "$env:windir\Temp\NinjaAgentInstall.msi"
+    Write-Log "Downloading new MSP NinjaRMM agent from: $InstallerURL"
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    (New-Object Net.WebClient).DownloadFile($InstallerURL, $InstallerPath)
+    Write-Log 'Installing new MSP NinjaRMM agent...'
+    $InstallResult = Start-Process 'msiexec.exe' -ArgumentList @('/i', $InstallerPath, '/quiet', '/norestart') -Wait -PassThru -NoNewWindow
+    Remove-Item $InstallerPath -Force -ErrorAction SilentlyContinue
     if ($InstallResult.ExitCode -ne 0) {
         throw "msiexec.exe exited with code $($InstallResult.ExitCode). Verify the installer URL is correct and accessible."
     }
