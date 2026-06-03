@@ -4,6 +4,26 @@ All notable changes to this repository are documented here. Entries are grouped 
 
 ---
 
+## 2026-06-03
+
+### RMM - Reinstall NinjaRMM Agent (fix - live test)
+- Fixed crash in orphaned installer key check: inner `try/catch` with `-ErrorAction Stop` on `Get-ItemPropertyValue` was letting the terminating error escape to the outer handler in PowerShell 5.1; switched to `-ErrorAction SilentlyContinue` + null check and used `PSChildName` instead of `Name` for the GUID exclusion filter; wrapped the entire check in its own `try/catch` so any future failure here is a non-fatal warning
+- Added Scheduled Task safety net: the Ninja scripting engine runs inside the Ninja process tree; when the MSI uninstaller removes the agent it terminates the script process before the install step can run; the script now registers a one-time SYSTEM-level Scheduled Task (fires T+5 min) before starting the uninstall; if the script survives it unregisters the task and runs `msiexec /i` directly for exit code checking; if killed the task fires as a fallback
+
+### RMM - Reinstall NinjaRMM Agent (update)
+- Rewrote to coding standards: added `#Requires -RunAsAdministrator`, comment-based help, `param()` block, `Write-Log` function with timestamps and severity levels, `try/catch` with explicit `exit 0`/`exit 1`, and `$ProgressPreference = 'SilentlyContinue'`
+- Added `$RTTInstallerURL` configuration variable near the top of the script for direct execution without any additional setup - the partner MSP fills in the URL and deploys as-is
+- Added Ninja script variable support: create a String variable named `installerUrl` in NinjaOne; its value is passed as `$env:installerUrl` and takes highest precedence
+- Installer URL precedence: Ninja script variable > `-InstallerURL` parameter > `$RTTInstallerURL` hardcoded value
+- Removed `Read-Host` prompt - script fails fast with exit 1 if no URL is available, which is correct for SYSTEM-level RMM execution
+- Removed manual UAC re-launch block (replaced by `#Requires -RunAsAdministrator`)
+- Removed global `$ErrorActionPreference = 'SilentlyContinue'`; scoped `-ErrorAction SilentlyContinue` to individual calls that are expected to fail on clean machines
+- Moved `Remove-NRRegistryItems` function definition before first use
+- Wrapped transcript in the main `try/catch` so it is always stopped on both success and failure paths
+- Updated `RMM/README.md` script index
+
+---
+
 ## 2026-05-22
 
 ### Windows - Configure Auto Logoff (fix)
