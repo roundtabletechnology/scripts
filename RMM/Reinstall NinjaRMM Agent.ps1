@@ -226,9 +226,9 @@ try {
     if ($LocationRaw) { $NinjaInstallLocation = $LocationRaw.Replace('/', '\') }
 
     if (-not (Test-Path "$NinjaInstallLocation\NinjaRMMAgent.exe")) {
-        $NinjaSvc = Get-Service -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'NinjaRMMAgent' }
-        if ($NinjaSvc -and $NinjaSvc.BinaryPathName) {
-            $NinjaInstallLocation = Split-Path $NinjaSvc.BinaryPathName.Trim('"')
+        $NinjaSvc = Get-CimInstance Win32_Service -Filter "Name='NinjaRMMAgent'" -ErrorAction SilentlyContinue
+        if ($NinjaSvc -and $NinjaSvc.PathName) {
+            $NinjaInstallLocation = Split-Path $NinjaSvc.PathName.Trim('"')
         } else {
             Write-Log 'Unable to locate Ninja installation path. Continuing with cleanup...' -Level Warning
         }
