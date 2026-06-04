@@ -45,6 +45,13 @@
     The installer URL is available from:
       New MSP NinjaOne > Administration > Installer > Windows Agent > Generate Installer
     Be sure to select the correct customer organization before generating the URL.
+
+    --- CANCELING THE INSTALL TASK ---
+    The script registers a Scheduled Task named 'NinjaRMM-NewAgentInstall' that fires
+    5 minutes after the script runs. The task removes itself after completing.
+    If you need to cancel the installation before the task fires, run:
+      Unregister-ScheduledTask -TaskName 'NinjaRMM-NewAgentInstall' -Confirm:$false
+    Or open Task Scheduler and delete the task from the Task Scheduler Library.
 #>
 
 param (
@@ -130,10 +137,10 @@ function Uninstall-NinjaMSI {
 }
 
 # Registers a one-time Scheduled Task to install the new agent under SYSTEM.
-# Used as a safety net in case this script's process is terminated by the MSI
-# uninstaller - NinjaOne's scripting engine runs inside the Ninja process tree,
-# and that entire tree is torn down when the agent is removed. The task fires
-# after the specified delay and deletes itself automatically after running.
+# The task is the sole install path - it runs outside this script's process tree,
+# so it survives even if the MSI uninstaller terminates this process. (NinjaOne's
+# scripting engine runs inside the Ninja process tree; the entire tree is torn down
+# when the agent is removed.) The task removes itself after running.
 function Register-InstallTask {
     param ([string]$URL)
     $TaskName      = 'NinjaRMM-NewAgentInstall'
@@ -148,6 +155,7 @@ function Register-InstallTask {
 (New-Object Net.WebClient).DownloadFile('$URL', `$f)
 Start-Process msiexec.exe -ArgumentList @('/i', `$f, '/quiet', '/norestart') -Wait -NoNewWindow
 Remove-Item `$f -Force -ErrorAction SilentlyContinue
+Unregister-ScheduledTask -TaskName '$TaskName' -Confirm:`$false -ErrorAction SilentlyContinue
 "@
     $Encoded   = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($Script))
     $Action    = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-ExecutionPolicy Bypass -NonInteractive -EncodedCommand $Encoded"
@@ -156,7 +164,7 @@ Remove-Item `$f -Force -ErrorAction SilentlyContinue
     $Principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
     Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Settings $Settings -Principal $Principal -Force -ErrorAction Stop | Out-Null
-    Write-Log "Safety-net install task registered - fires at $((Get-Date).AddMinutes(5).ToString('HH:mm:ss')) if this process is terminated."
+    Write-Log "Install task registered - the new agent will be installed at approximately $((Get-Date).AddMinutes(5).ToString('HH:mm:ss')).  To cancel, run: Unregister-ScheduledTask -TaskName '$TaskName' -Confirm:`$false"
 }
 
 # Removes Ninja Remote (ncstreamer) registry entries from a specific user profile hive.
@@ -491,24 +499,7 @@ try {
     }
 
     Write-Log 'Ninja Remote removal complete.'
-    Write-Log 'NinjaRMM agent removal complete. Review output above for any warnings.'
-
-    # --- Install new MSP NinjaRMM agent ---
-    # Unregister the safety-net task - the script survived and will handle the
-    # install directly so we can capture the exit code and log the result.
-    Unregister-ScheduledTask -TaskName 'NinjaRMM-NewAgentInstall' -Confirm:$false -ErrorAction SilentlyContinue
-    $InstallerPath = "$env:windir\Temp\NinjaAgentInstall.msi"
-    Write-Log "Downloading new MSP NinjaRMM agent from: $InstallerURL"
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    (New-Object Net.WebClient).DownloadFile($InstallerURL, $InstallerPath)
-    Write-Log 'Installing new MSP NinjaRMM agent...'
-    $InstallResult = Start-Process 'msiexec.exe' -ArgumentList @('/i', $InstallerPath, '/quiet', '/norestart') -Wait -PassThru -NoNewWindow
-    Remove-Item $InstallerPath -Force -ErrorAction SilentlyContinue
-    if ($InstallResult.ExitCode -ne 0) {
-        throw "msiexec.exe exited with code $($InstallResult.ExitCode). Verify the installer URL is correct and accessible."
-    }
-
-    Write-Log 'New MSP NinjaRMM agent installation complete.' -Level Success
+    Write-Log 'NinjaRMM agent removal complete. The install task will fire shortly - check the Ninja device timeline once the new agent checks in.' -Level Success
     Stop-Transcript | Out-Null
     exit 0
 }
