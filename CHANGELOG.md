@@ -6,6 +6,11 @@ All notable changes to this repository are documented here. Entries are grouped 
 
 ## 2026-06-04
 
+### RMM - Reinstall NinjaRMM Agent (fix - PS5.1 service path fallback)
+- Fixed install location fallback that used `Get-Service` and `BinaryPathName`; `BinaryPathName` is not a property of `ServiceController` in PowerShell 5.1/.NET Framework - it was added in PS7/.NET 5
+- Replaced with `Get-CimInstance Win32_Service` and its `PathName` property, which works on PS3+ through PS7
+- This fallback only fires when Ninja's main registry key is absent (partial/failed prior uninstall), but the path lookup was silently returning null in those cases
+
 ### RMM - Reinstall NinjaRMM Agent (refactor - install architecture)
 - Removed the inline install path; the Scheduled Task is now the sole install path
 - Previously the script tried to unregister the task and run `msiexec` directly if it survived the uninstall; this introduced a race condition - if cleanup took longer than 5 minutes the task could fire while the script was still running, resulting in a double install
