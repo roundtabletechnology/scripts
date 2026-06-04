@@ -4,6 +4,15 @@ All notable changes to this repository are documented here. Entries are grouped 
 
 ---
 
+## 2026-06-04
+
+### RMM - Reinstall NinjaRMM Agent (fix - SYSTEM account URL access)
+- Fixed 80070005 Access Denied when the scheduled task safety net tried to run `msiexec /i <URL>` as SYSTEM
+- Root cause: the SYSTEM account uses WinHTTP, which does not inherit user-context proxy or authentication settings; passing a URL directly to msiexec as SYSTEM fails without a proxy configured for WinHTTP
+- Fix: both the scheduled task action and the inline install path now download the MSI to `%windir%\Temp\NinjaAgentInstall.msi` via .NET `WebClient` (with TLS 1.2 forced) and then run `msiexec /i` against the local file path
+
+---
+
 ## 2026-06-03
 
 ### RMM - Reinstall NinjaRMM Agent (fix - live test)
