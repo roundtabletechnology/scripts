@@ -6,6 +6,13 @@ All notable changes to this repository are documented here. Entries are grouped 
 
 ## 2026-06-04
 
+### RMM - Reinstall NinjaRMM Agent (refactor - install architecture)
+- Removed the inline install path; the Scheduled Task is now the sole install path
+- Previously the script tried to unregister the task and run `msiexec` directly if it survived the uninstall; this introduced a race condition - if cleanup took longer than 5 minutes the task could fire while the script was still running, resulting in a double install
+- The task now handles the install in all cases; the script's job ends after cleanup
+- Added self-unregistration to the task's script block so it removes itself from Task Scheduler after running
+- Added a cancel/cleanup note to the `.NOTES` section explaining how to abort the install task before it fires
+
 ### RMM - Reinstall NinjaRMM Agent (fix - SYSTEM account URL access)
 - Fixed 80070005 Access Denied when the scheduled task safety net tried to run `msiexec /i <URL>` as SYSTEM
 - Root cause: the SYSTEM account uses WinHTTP, which does not inherit user-context proxy or authentication settings; passing a URL directly to msiexec as SYSTEM fails without a proxy configured for WinHTTP
