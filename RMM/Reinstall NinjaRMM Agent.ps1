@@ -140,21 +140,16 @@ function Uninstall-NinjaMSI {
 # The task is the sole install path - it runs outside this script's process tree,
 # so it survives even if the MSI uninstaller terminates this process. (NinjaOne's
 # scripting engine runs inside the Ninja process tree; the entire tree is torn down
-# when the agent is removed.) The task removes itself after running.
+# when the agent is removed.) The MSI is already on disk before this is called,
+# so the task only needs to run msiexec - no network access required when it fires.
+# The task removes itself after running.
 function Register-InstallTask {
-    param ([string]$URL)
-    $TaskName      = 'NinjaRMM-NewAgentInstall'
-    $InstallerPath = "$env:windir\Temp\NinjaAgentInstall.msi"
-    # The task runs PowerShell to download the MSI first, then installs from a local path.
-    # msiexec as SYSTEM cannot reliably fetch URLs directly - the SYSTEM account uses
-    # WinHTTP, which does not inherit user-context proxy or authentication settings.
-    # .NET's WebClient resolves this correctly.
+    param ([string]$LocalPath)
+    $TaskName = 'NinjaRMM-NewAgentInstall'
+    # MSI was already downloaded before cleanup started - install from the local file.
     $Script = @"
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-`$f = '$InstallerPath'
-(New-Object Net.WebClient).DownloadFile('$URL', `$f)
-Start-Process msiexec.exe -ArgumentList @('/i', `$f, '/quiet', '/norestart') -Wait -NoNewWindow
-Remove-Item `$f -Force -ErrorAction SilentlyContinue
+Start-Process msiexec.exe -ArgumentList @('/i', '$LocalPath', '/quiet', '/norestart') -Wait -NoNewWindow
+Remove-Item '$LocalPath' -Force -ErrorAction SilentlyContinue
 Unregister-ScheduledTask -TaskName '$TaskName' -Confirm:`$false -ErrorAction SilentlyContinue
 "@
     $Encoded   = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($Script))
@@ -211,9 +206,23 @@ try {
         $UninstallRegPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
     }
 
+    # --- Download new MSP agent installer ---
+    # Download BEFORE touching the agent. If the URL is unreachable or the download
+    # fails we abort here without having modified the machine at all. The task installs
+    # from this local file, so no network access is required when it fires.
+    $InstallerPath = "$env:windir\Temp\NinjaAgentInstall.msi"
+    Write-Log "Downloading new MSP NinjaRMM agent from: $InstallerURL"
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    try {
+        (New-Object Net.WebClient).DownloadFile($InstallerURL, $InstallerPath)
+    } catch {
+        throw "Failed to download installer: $($_.Exception.Message). No changes were made to this machine."
+    }
+    Write-Log 'Installer downloaded. Registering install task and beginning removal...'
+
     # Register the install task before touching the agent so it fires even if
     # the uninstaller kills this process.
-    Register-InstallTask -URL $InstallerURL
+    Register-InstallTask -LocalPath $InstallerPath
 
     Write-Log 'Beginning NinjaRMM agent removal...'
 
@@ -287,6 +296,15 @@ try {
         Remove-Item $NinjaDataDir -Recurse -Force -ErrorAction SilentlyContinue
         if (Test-Path $NinjaDataDir) {
             Write-Log "Failed to remove data directory: $NinjaDataDir" -Level Warning
+        }
+    }
+
+    # NJCliPSh is the NinjaOne PowerShell module installed alongside the agent.
+    $NinjaModulePath = "$env:ProgramFiles\WindowsPowerShell\Modules\NJCliPSh"
+    if (Test-Path $NinjaModulePath) {
+        Remove-Item $NinjaModulePath -Recurse -Force -ErrorAction SilentlyContinue
+        if (Test-Path $NinjaModulePath) {
+            Write-Log "Failed to remove Ninja PowerShell module: $NinjaModulePath" -Level Warning
         }
     }
 

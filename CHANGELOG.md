@@ -6,6 +6,11 @@ All notable changes to this repository are documented here. Entries are grouped 
 
 ## 2026-06-04
 
+### RMM - Reinstall NinjaRMM Agent (improvement - download before uninstall + NJCliPSh cleanup)
+- MSI is now downloaded at the top of the script, before the agent is touched. If the URL is unreachable or the download fails the script exits 1 immediately with no changes made to the machine. Previously a bad URL would orphan the device - agent removed, new agent never installed.
+- `Register-InstallTask` simplified: removed the download logic from the task's embedded script. The task now just runs `msiexec /i <local path>` against the already-downloaded file, with no network dependency at fire time.
+- Added cleanup of `$env:ProgramFiles\WindowsPowerShell\Modules\NJCliPSh` - the NinjaOne PowerShell module installed alongside the agent that was not previously removed.
+
 ### RMM - Reinstall NinjaRMM Agent (fix - PS5.1 service path fallback)
 - Fixed install location fallback that used `Get-Service` and `BinaryPathName`; `BinaryPathName` is not a property of `ServiceController` in PowerShell 5.1/.NET Framework - it was added in PS7/.NET 5
 - Replaced with `Get-CimInstance Win32_Service` and its `PathName` property, which works on PS3+ through PS7
