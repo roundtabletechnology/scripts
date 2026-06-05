@@ -1,4 +1,4 @@
-﻿#Requires -RunAsAdministrator
+#Requires -RunAsAdministrator
 
 <#
 .SYNOPSIS
@@ -215,10 +215,43 @@ try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     try {
         (New-Object Net.WebClient).DownloadFile($InstallerURL, $InstallerPath)
+
+        # Validate that the downloaded file is a valid MSI database
+        if (-not (Test-Path $InstallerPath)) {
+            throw "Downloaded file does not exist at $InstallerPath."
+        }
+
+        $fileSize = (Get-Item $InstallerPath).Length
+        if ($fileSize -lt 1024) {
+            # An MSI installer is always larger than 1KB; a tiny file is likely an error message or empty.
+            throw "Downloaded file is too small ($fileSize bytes) to be a valid MSI installer."
+        }
+
+        # Verify MSI file signature (OLE Compound Document header: D0 CF 11 E0 A1 B1 1A E1)
+        $bytes = New-Object byte[] 8
+        $stream = [System.IO.File]::OpenRead($InstallerPath)
+        $null = $stream.Read($bytes, 0, 8)
+        $stream.Close()
+        $hex = ($bytes | ForEach-Object { $_.ToString('X2') }) -join ' '
+        if ($hex -ne 'D0 CF 11 E0 A1 B1 1A E1') {
+            throw "Downloaded file is not a valid MSI installer (magic bytes: $hex)."
+        }
+
+        # Verify via Windows Installer COM object to be absolutely certain it is a valid database
+        $wi = New-Object -ComObject WindowsInstaller.Installer
+        $db = $wi.OpenDatabase($InstallerPath, 0)
+        $db = $null
+        $wi = $null
+        [System.GC]::Collect()
+        [System.GC]::WaitForPendingFinalizers()
+
     } catch {
-        throw "Failed to download installer: $($_.Exception.Message). No changes were made to this machine."
+        if (Test-Path $InstallerPath) {
+            Remove-Item $InstallerPath -Force -ErrorAction SilentlyContinue
+        }
+        throw "Failed to download or validate installer: $($_.Exception.Message). No changes were made to this machine."
     }
-    Write-Log 'Installer downloaded. Registering install task and beginning removal...'
+    Write-Log 'Installer downloaded and validated. Registering install task and beginning removal...'
 
     # Register the install task before touching the agent so it fires even if
     # the uninstaller kills this process.

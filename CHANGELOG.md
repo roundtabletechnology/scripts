@@ -2,6 +2,13 @@
 
 All notable changes to this repository are documented here. Entries are grouped by date where commit history allows, otherwise by theme.
 
+## 2026-06-05
+
+### RMM - Reinstall NinjaRMM Agent (improvement - MSI installer validation)
+- Added robust multi-step verification of the downloaded NinjaOne MSI installer before beginning uninstallation.
+- Verifies file existence, minimum size (>= 1KB), OLE Compound Document signature (D0 CF 11 E0 A1 B1 1A E1), and structural integrity via the Windows Installer (WindowsInstaller.Installer) COM object's OpenDatabase method.
+- Aborts execution and preserves the existing agent if the downloaded file is corrupt, empty, or an HTML error page.
+
 ---
 
 ## 2026-06-04
