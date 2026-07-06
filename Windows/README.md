@@ -69,6 +69,7 @@ Scripts are organized into subfolders by function. For guidance on downloading a
 | [Uninstall Malwarebytes.ps1](Applications/Uninstall%20Malwarebytes.ps1) | Silently uninstalls Malwarebytes |
 | [Uninstall Out-N-About.bat](Applications/Uninstall%20Out-N-About.bat) | Removes Out-N-About time tracking software |
 | [Uninstall Sage Timeslips.bat](Applications/Uninstall%20Sage%20Timeslips.bat) | Removes Sage Timeslips |
+| [Uninstall ScreenConnect.ps1](Applications/Uninstall%20ScreenConnect.ps1) | Silently removes all installed ScreenConnect (ConnectWise Control) Client instances, no reboot |
 | [Uninstall SonicWall Global VPN.ps1](Applications/Uninstall%20SonicWall%20Global%20VPN.ps1) | Silently uninstalls the SonicWall Global VPN client |
 | [Uninstall Sophos Endpoint.ps1](Applications/Uninstall%20Sophos%20Endpoint.ps1) | Removes Sophos Endpoint using the Sophos uninstaller |
 | [Uninstall Webroot.bat](Applications/Uninstall%20Webroot.bat) | Removes the Webroot SecureAnywhere agent |

@@ -2,6 +2,15 @@
 
 All notable changes to this repository are documented here. Entries are grouped by date where commit history allows, otherwise by theme.
 
+## 2026-07-06
+
+### Windows/Applications - Uninstall ScreenConnect (new script)
+- Added `Uninstall ScreenConnect.ps1` to silently remove all installed ScreenConnect (ConnectWise Control) Client instances via NinjaRMM, targeting PowerShell 5.1+ (no `wmic`, no PS7-only cmdlets).
+- Handles multiple simultaneous instances (each ScreenConnect Client install has its own "thumbprint" in its display name, e.g. "ScreenConnect Client (8f53c95c9d2e1234)") by enumerating the Uninstall registry (native + WOW6432Node) and looping per instance.
+- Per instance: stops the matching service and sets it to Disabled, kills any running ScreenConnect processes, extracts the MSI product code from the UninstallString via regex, then runs `msiexec /x {guid} /qn /norestart` - no dialogs and no reboot, since end users may be actively on the machine.
+- Sweeps for and removes leftover services, install directories (Program Files, Program Files (x86), ProgramData), and registry entries the MSI uninstaller leaves behind, then re-verifies and exits 1 if anything is still present so failures surface in Ninja rather than silently reporting success.
+- Updated `Windows/README.md` script index.
+
 ## 2026-06-05
 
 ### RMM - Reinstall NinjaRMM Agent (improvement - MSI installer validation)
