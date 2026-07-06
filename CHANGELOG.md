@@ -4,6 +4,14 @@ All notable changes to this repository are documented here. Entries are grouped 
 
 ## 2026-07-06
 
+### Windows/Applications - Install WireGuard (update - per-user access, config delivery, registry fix)
+- Added `-TargetUser` parameter (and `targetUser` Ninja script variable) to grant WireGuard tunnel management to one specific user instead of every user on the machine. When set, existing `Authenticated Users`/`Users` group membership on Network Configuration Operators is removed first so access is actually restricted to that user.
+- `wireguardConfig` is now read via `Ninja-Property-Get` in addition to the `$env:wireguardConfig` script-variable override, so the organization custom field works without a separate script-variable mapping in the automation.
+- Tunnel config delivery switched from `wireguard.exe /installtunnel` to the file-drop method: writes to a temp file first (avoids WireGuard's FileSystemWatcher reacting to a 0-byte file mid-write), copies it into `Data\Configurations\wg0.conf`, then waits up to 15s for the WireGuard Manager service to detect, encrypt (`wg0.conf.dpapi`), and import it.
+- Fixed `LimitedOperatorUI` registry key being written to `WOW6432Node` instead of the native 64-bit hive when the host process is 32-bit (common for RMM agents) - now uses the `Microsoft.Win32.RegistryKey` API with an explicit `Registry64` view, with a readback verification step.
+- Added `Test-UserExists`/`Show-LocalUsersList` to validate `-TargetUser` up front and fail fast with the local user list printed for troubleshooting if the name doesn't resolve.
+- Updated `.NOTES` and `.PARAMETER` comment-based help to document the new parameter, custom-field auto-read, and new config path.
+
 ### Windows/Applications - Uninstall ScreenConnect (new script)
 - Added `Uninstall ScreenConnect.ps1` to silently remove all installed ScreenConnect (ConnectWise Control) Client instances via NinjaRMM, targeting PowerShell 5.1+ (no `wmic`, no PS7-only cmdlets).
 - Handles multiple simultaneous instances (each ScreenConnect Client install has its own "thumbprint" in its display name, e.g. "ScreenConnect Client (8f53c95c9d2e1234)") by enumerating the Uninstall registry (native + WOW6432Node) and looping per instance.
