@@ -1,5 +1,3 @@
-#Requires -RunAsAdministrator
-
 <#
 .SYNOPSIS
     Silently removes all installed ScreenConnect (ConnectWise Control) Client instances from a Windows machine.
@@ -46,6 +44,16 @@
 param (
     [string]$NameFilter = 'ScreenConnect*'
 )
+
+# Equivalent to "#Requires -RunAsAdministrator", which PowerShell 2.0/3.0 (the default on
+# Server 2008 R2 / Server 2012) fails to parse as a switch, aborting the whole script before
+# any code runs. This check works on PS 2.0+.
+$CurrentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$CurrentPrincipal = New-Object Security.Principal.WindowsPrincipal($CurrentIdentity)
+if (-not $CurrentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Error 'This script requires administrator privileges.'
+    exit 1
+}
 
 $ProgressPreference    = 'SilentlyContinue'
 $ErrorActionPreference = 'Continue'
