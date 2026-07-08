@@ -90,6 +90,7 @@ Scripts are organized into subfolders by function. For guidance on downloading a
 | Script | Description |
 |---|---|
 | [Audit RMM Group Policies.ps1](OS/Maintenance/Audit%20RMM%20Group%20Policies.ps1) | Reports GPOs deployed by RMM tooling to identify conflicts or stale policies |
+| [Check for WSUS Settings and remove.ps1](OS/Maintenance/Check%20for%20WSUS%20Settings%20and%20remove.ps1) | Detects WSUS registry/GPO settings, reports the source (registry, Local GPO, or domain GPO/GPP), and optionally removes them |
 | [Cleanup Driver Cache.ps1](OS/Maintenance/Cleanup%20Driver%20Cache.ps1) | Removes old cached driver packages from the driver store |
 | [Cleanup Intune MSI Cache.ps1](OS/Maintenance/Cleanup%20Intune%20MSI%20Cache.ps1) | Clears the Intune cached MSI installer files |
 | [Cleanup Old Drivers.ps1](OS/Maintenance/Cleanup%20Old%20Drivers.ps1) | Removes outdated third-party drivers from the system |

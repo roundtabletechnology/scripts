@@ -2,6 +2,18 @@
 
 All notable changes to this repository are documented here. Entries are grouped by date where commit history allows, otherwise by theme.
 
+## 2026-07-08
+
+### Windows/OS/Maintenance - Check for WSUS Settings and remove (new script)
+- Adds `Check for WSUS Settings and remove.ps1` to detect WSUS registry settings (`HKLM:\Software\Policies\Microsoft\Windows\WindowsUpdate`), identify whether they're managed via Group Policy, and optionally remove them via a new `-RemoveWSUSSettings` switch (Ninja checkbox `removeWsusSettings`).
+- GPO detection checks both domain SYSVOL and the local Group Policy folders on every device (previously servers only checked SYSVOL), so a true Local Group Policy Object is correctly identified instead of being reported as an unattributed "orphaned" registry setting.
+- GPO detection also scans Group Policy Preferences `Registry.xml` files, not just Administrative Templates `Registry.pol` - some GPOs (e.g. SBS-era "Update Services Common Settings" policies) push WSUS values via Preferences.
+- Fixed a bug where a GPO deliberately pushing blank/nullified `WUServer`/`WUStatusServer` values (a common way to overwrite a stale tattooed address) caused GPO detection to be skipped entirely, since it was mistaken for "nothing configured."
+- Adds `Get-AppliedGPOs` (via `gpresult`) to cross-check the source when it can't be traced back to a specific GPO from the Registry.pol/xml scan; only entries whose name matches WSUS/Update/Patch are written to the custom field to stay under NinjaOne's ~200 character field limit, with the full list logged to console.
+- After a successful removal, restarts `wuauserv`/`UsoSvc` so the Windows Update Agent drops any endpoint it already had cached in memory - without this, a patch scan run immediately after removal could still fail trying to reach the now-deleted server even though the registry was already clean.
+- The custom field reports the end result of the run (post-removal state), while the console output shows the full before/after detail; a `Script Version` line is printed first so it's easy to confirm which revision actually ran on a given endpoint.
+- Updated `Windows/README.md` script index.
+
 ## 2026-07-06
 
 ### Windows/Applications - Install WireGuard (update - per-user access, config delivery, registry fix)
