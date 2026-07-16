@@ -42,6 +42,7 @@ Scripts are organized into subfolders by function. For guidance on downloading a
 | [Install AnyConnect.bat](Applications/Install%20AnyConnect.bat) | Installs Cisco AnyConnect VPN client |
 | [Install AnyDesk.ps1](Applications/Install%20AnyDesk.ps1) | Silently installs AnyDesk remote access |
 | [Install BitDefender GravityZone.ps1](Applications/Install%20BitDefender%20GravityZone.ps1) | Installs the BitDefender GravityZone endpoint agent |
+| [Install Claude Desktop.ps1](Applications/Install%20Claude%20Desktop.ps1) | Downloads the official MSIX and provisions Claude Desktop machine-wide for all users, including standard (non-admin) accounts |
 | [Install ConnectSecure Agent.ps1](Applications/Install%20ConnectSecure%20Agent.ps1) | Installs the ConnectSecure (CyberCNS) vulnerability scanning agent |
 | [Install Datto Endpoint Backup.ps1](Applications/Install%20Datto%20Endpoint%20Backup.ps1) | Installs the Datto Endpoint Backup for PCs agent |
 | [Install Dialpad.ps1](Applications/Install%20Dialpad.ps1) | Silently installs the Dialpad softphone client |
