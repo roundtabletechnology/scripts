@@ -8,6 +8,18 @@
     (for example, one legitimate MSP instance and one dropped by an attacker via phishing/social engineering),
     each with its own service, process, and MSI product code.
 
+    Before touching anything, this script checks two common reinstall/reinfection vectors so a client that keeps
+    coming back isn't a mystery:
+      - Group Policy: scans local and (if domain-joined) SYSVOL Group Policy files - Administrative Templates
+        (Registry.pol), Group Policy Preferences registry items (Registry.xml), and Group Policy Preferences
+        Scheduled Tasks (ScheduledTasks.xml) - for any reference to ScreenConnect/ConnectWise Control, and resolves
+        matches back to the owning GPO's display name.
+      - Task Scheduler: enumerates every Scheduled Task on the machine (regardless of whether it came from a GPO
+        or was created locally) whose action executable or arguments reference ScreenConnect/ConnectWise Control,
+        and disables (does not delete) any it finds unless -SkipScheduledTaskRemediation is specified.
+    Both checks run every time, even if no ScreenConnect instance is currently installed, since the most useful
+    moment to catch the source is often right after a previous run already removed it.
+
     For every instance found in the Windows Uninstall registry, this script:
       1. Stops the matching Windows service(s) and sets their startup type to Disabled, so a pending start
          request or delayed auto-start cannot relaunch the client mid-cleanup.
@@ -17,8 +29,9 @@
          (/qn /norestart) - no dialogs and no reboot, so end users actively on the machine are not interrupted.
       4. Cleans up any service, install directory, or registry entry the MSI uninstaller leaves behind.
 
-    Safe to run on a machine with zero, one, or several ScreenConnect Client instances - it is a no-op
-    (exit 0) if none are found, and processes every matching instance it does find in a single run.
+    Safe to run on a machine with zero, one, or several ScreenConnect Client instances - the GPO/Scheduled Task
+    checks and any resulting task remediation still run even when none are found, and uninstall processes every
+    matching instance it does find in a single run.
 
 .PARAMETER NameFilter
     Wildcard used to match ScreenConnect Client display names, services, and processes.
@@ -26,23 +39,39 @@
     Narrow it to a specific instance (e.g. 'ScreenConnect Client (8f53c95c9d2e1234)') to remove only
     that one and leave other instances in place.
 
+.PARAMETER SkipScheduledTaskRemediation
+    If specified, Scheduled Tasks found referencing ScreenConnect/ConnectWise Control are still logged as a
+    warning but are left enabled. By default (no switch needed), any matching task is disabled - not deleted -
+    so it stops relaunching the installer without destroying the task definition in case it needs review.
+
 .EXAMPLE
     .\Uninstall ScreenConnect.ps1
 
-    Removes every ScreenConnect Client instance found on the machine.
+    Checks for GPOs and Scheduled Tasks referencing ScreenConnect (disabling any matching task), then removes
+    every ScreenConnect Client instance found on the machine.
 
 .EXAMPLE
     .\Uninstall ScreenConnect.ps1 -NameFilter 'ScreenConnect Client (8f53c95c9d2e1234)'
 
-    Removes only the specified instance, leaving any other ScreenConnect Client installs untouched.
+    Removes only the specified instance, leaving any other ScreenConnect Client installs untouched. The GPO and
+    Scheduled Task checks still run and are not scoped to the specific instance.
+
+.EXAMPLE
+    .\Uninstall ScreenConnect.ps1 -SkipScheduledTaskRemediation
+
+    Reports any GPO or Scheduled Task referencing ScreenConnect without disabling matching tasks, then proceeds
+    with uninstalling any instance found.
 
 .NOTES
     Does not reboot and does not schedule a restart - safe to run while end users are actively working.
     Deploy via NinjaRMM as a scheduled/on-demand script run as SYSTEM.
+    A GPO match is reported only, never removed/unlinked automatically - Group Policy changes affect every
+    computer the GPO applies to, so that decision is left to a human reviewing Group Policy Management.
 #>
 
 param (
-    [string]$NameFilter = 'ScreenConnect*'
+    [string]$NameFilter = 'ScreenConnect*',
+    [switch]$SkipScheduledTaskRemediation
 )
 
 # Equivalent to "#Requires -RunAsAdministrator", which PowerShell 2.0/3.0 (the default on
@@ -127,16 +156,164 @@ function Get-ScreenConnectInstances {
         Where-Object { $_.DisplayName -like $Filter -and $_.UninstallString -match 'msiexec' }
 }
 
+# Searches local and (if domain-joined) SYSVOL Group Policy files - Administrative Templates (Registry.pol), Group
+# Policy Preferences registry items (Registry.xml), and Group Policy Preferences Scheduled Tasks (ScheduledTasks.xml)
+# - for any reference to ScreenConnect/ConnectWise Control. A Client instance that keeps reinstalling itself on its
+# own is often traceable to a GPO (compromised, misconfigured, or a leftover from a prior MSP) rather than a fresh
+# phishing/social engineering drop every time, so this surfaces that possibility instead of leaving techs to
+# uninstall the same instance over and over. Mirrors the GPO-file-scanning approach used by
+# "Check for WSUS Settings and remove.ps1", adapted to search file content for a product name instead of parsing a
+# specific registry policy value.
+function Get-ScreenConnectGPOSources {
+    $SearchTerms = @('ScreenConnect', 'ConnectWiseControl', 'ConnectWise Control')
+
+    $GPOFolderPaths = @(
+        "$env:windir\System32\GroupPolicy\"
+        "$env:windir\System32\GroupPolicyUsers\"
+    )
+
+    $ComputerSystem = $null
+    try {
+        $ComputerSystem = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
+    } catch {
+        Write-Log "Could not determine domain membership: $($_.Exception.Message)" -Level Warning
+    }
+
+    if ($ComputerSystem -and $ComputerSystem.PartOfDomain -and $ComputerSystem.Domain) {
+        $GPOFolderPaths += "\\$($ComputerSystem.Domain)\SYSVOL\$($ComputerSystem.Domain)\Policies\"
+    }
+
+    $RawMatches = foreach ($FolderPath in $GPOFolderPaths) {
+        Get-ChildItem -Path $FolderPath -Include 'Registry.pol', 'Registry.xml', 'ScheduledTasks.xml' -Recurse -File -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                $PolicyFile = $_
+                # Registry.pol is UTF-16 with embedded nulls between characters; Registry.xml/ScheduledTasks.xml are plain XML
+                $Content = (Get-Content -Path $PolicyFile.FullName -Raw -ErrorAction SilentlyContinue) -replace "`0", ''
+                if ([string]::IsNullOrEmpty($Content)) { return }
+
+                $MatchedTerm = $SearchTerms | Where-Object { $Content -match [regex]::Escape($_) } | Select-Object -First 1
+                if (-not $MatchedTerm) { return }
+
+                # Extract the GPO GUID from the file path, e.g. "...\Policies\{GUID}\Machine\Registry.pol" or
+                # "...\Policies\{GUID}\Machine\Preferences\ScheduledTasks\ScheduledTasks.xml"
+                $GPOId = $PolicyFile.FullName -replace '.*\\Policies\\(.*?)\\(Machine|User)\\.*', '$1'
+                if ($GPOId -notmatch '^\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}$') {
+                    # Not a domain GPO GUID - if it's from the local GroupPolicy folder, it's a true Local GPO (gpedit.msc)
+                    if ($PolicyFile.FullName -like "$env:windir\System32\GroupPolicy\*") {
+                        $GPOId = 'Local Group Policy'
+                    } else {
+                        return
+                    }
+                }
+
+                [PSCustomObject]@{
+                    GPOId     = $GPOId
+                    File      = $PolicyFile.FullName
+                    MatchedOn = $MatchedTerm
+                }
+            }
+    }
+
+    if (-not $RawMatches) { return @() }
+
+    # Resolve matched GPO GUIDs to display names, and drop any GUID that isn't actually applied to this computer
+    # (e.g. a stale SYSVOL copy of a GPO that has since been unlinked).
+    $GPOHistoryPath = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Group Policy\History\{35378EAC-683F-11D2-A89A-00C04FBBCFA2}'
+    $ActiveGPOs = @()
+    try {
+        $ActiveGPOs = Get-ChildItem -Path $GPOHistoryPath -ErrorAction Stop |
+            ForEach-Object { Get-ItemProperty -Path $_.PSPath -Name DisplayName, GPOName -ErrorAction SilentlyContinue }
+    } catch {
+        Write-Log "Could not read GPO history to resolve display names: $($_.Exception.Message)" -Level Warning
+    }
+
+    foreach ($Match in $RawMatches) {
+        if ($Match.GPOId -ne 'Local Group Policy' -and $Match.GPOId -notin $ActiveGPOs.GPOName) { continue }
+
+        $DisplayName = if ($Match.GPOId -eq 'Local Group Policy') {
+            'Local Group Policy'
+        } else {
+            $ActiveGPOs | Where-Object { $_.GPOName -eq $Match.GPOId } | Select-Object -First 1 -ExpandProperty DisplayName
+        }
+
+        [PSCustomObject]@{
+            GPODisplayName = $DisplayName
+            MatchedFile    = $Match.File
+            MatchedOn      = $Match.MatchedOn
+        }
+    }
+}
+
+# Enumerates every Scheduled Task on the machine (regardless of whether it came from a GPO, GPP, or was created
+# locally) whose action executable, arguments, or working directory reference ScreenConnect/ConnectWise Control.
+# A task silently relaunching the installer is a common reinfection vector on its own, independent of any GPO.
+function Get-ScreenConnectScheduledTasks {
+    $SearchTerms = @('ScreenConnect', 'ConnectWiseControl', 'ConnectWise Control')
+
+    Get-ScheduledTask -ErrorAction SilentlyContinue | ForEach-Object {
+        $Task = $_
+        $MatchedAction = $Task.Actions | Where-Object {
+            $ActionText = "$($_.Execute) $($_.Arguments) $($_.WorkingDirectory)"
+            $SearchTerms | Where-Object { $ActionText -match [regex]::Escape($_) }
+        } | Select-Object -First 1
+
+        if ($MatchedAction) {
+            [PSCustomObject]@{
+                TaskName  = $Task.TaskName
+                TaskPath  = $Task.TaskPath
+                State     = $Task.State
+                Author    = $Task.Author
+                Execute   = $MatchedAction.Execute
+                Arguments = $MatchedAction.Arguments
+            }
+        }
+    }
+}
+
 $Now     = Get-Date -Format 'yyyy-MM-dd_HHmmss'
 $LogPath = "$env:windir\Temp\UninstallScreenConnect_$Now.log"
 Start-Transcript -Path $LogPath -Force | Out-Null
 
 try {
+    # --- Reinstall/reinfection source detection ---
+    # Runs every time, regardless of whether an instance is currently installed - the most useful moment to catch
+    # a GPO or Scheduled Task that's reinstalling ScreenConnect is often right after a previous run already removed it.
+    Write-Log 'Checking Group Policy for anything referencing ScreenConnect...'
+    $GPOSources = @(Get-ScreenConnectGPOSources)
+    if ($GPOSources.Count -eq 0) {
+        Write-Log 'No GPOs referencing ScreenConnect were found.'
+    } else {
+        foreach ($Source in $GPOSources) {
+            Write-Log "GPO '$($Source.GPODisplayName)' references ScreenConnect via '$($Source.MatchedFile)' (matched on '$($Source.MatchedOn)'). This GPO may be responsible for reinstalling ScreenConnect - review and, if appropriate, unlink/edit it in Group Policy Management." -Level Warning
+        }
+    }
+
+    Write-Log 'Checking Windows Task Scheduler for tasks referencing ScreenConnect...'
+    $SuspectTasks = @(Get-ScreenConnectScheduledTasks)
+    if ($SuspectTasks.Count -eq 0) {
+        Write-Log 'No Scheduled Tasks referencing ScreenConnect were found.'
+    } else {
+        foreach ($Task in $SuspectTasks) {
+            $TaskFullPath = "$($Task.TaskPath)$($Task.TaskName)"
+            Write-Log "Scheduled Task '$TaskFullPath' (State: $($Task.State), Author: $($Task.Author)) references ScreenConnect: '$($Task.Execute) $($Task.Arguments)'" -Level Warning
+
+            if ($SkipScheduledTaskRemediation) {
+                continue
+            }
+            try {
+                Disable-ScheduledTask -TaskName $Task.TaskName -TaskPath $Task.TaskPath -ErrorAction Stop | Out-Null
+                Write-Log "Disabled Scheduled Task '$TaskFullPath' so it can no longer relaunch the ScreenConnect installer." -Level Warning
+            } catch {
+                Write-Log "Failed to disable Scheduled Task '$TaskFullPath': $($_.Exception.Message)" -Level Error
+            }
+        }
+    }
+
     Write-Log "Searching for ScreenConnect Client installs matching '$NameFilter'..."
     $Instances = @(Get-ScreenConnectInstances -Filter $NameFilter)
 
     if ($Instances.Count -eq 0) {
-        Write-Log 'No matching ScreenConnect Client installs found. Nothing to do.' -Level Success
+        Write-Log 'No matching ScreenConnect Client installs found. Nothing to uninstall.' -Level Success
         Stop-Transcript | Out-Null
         exit 0
     }
