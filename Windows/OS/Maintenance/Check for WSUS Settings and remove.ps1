@@ -2,9 +2,11 @@
 
 <#
 .SYNOPSIS
-    Determines if Windows Server Update Services (WSUS) settings are configured in the registry and identifies if they are managed via Group Policy (GPO). You can also write the results to a text custom field, and optionally remove the WSUS settings from the registry.
+    Audits Windows Server Update Services (WSUS) settings, removes them, and repairs the Windows Update Agent. Determines if WSUS settings are configured in the registry and identifies if they are managed via Group Policy (GPO). You can also write the results to a text custom field, optionally remove the WSUS settings from the registry, reset the Windows Update cache, and test connectivity to Microsoft's Windows Update endpoints.
 .DESCRIPTION
-    Determines if Windows Server Update Services (WSUS) settings are configured in the registry and identifies if they are managed via Group Policy (GPO). You can also write the results to a text custom field, and optionally remove the WSUS settings from the registry.
+    Audits Windows Server Update Services (WSUS) settings, removes them, and repairs the Windows Update Agent. Determines if WSUS settings are configured in the registry and identifies if they are managed via Group Policy (GPO). You can also write the results to a text custom field, optionally remove the WSUS settings from the registry, reset the Windows Update cache, and test connectivity to Microsoft's Windows Update endpoints.
+
+    This script exists to clean up after decommissioned/stale WSUS servers. Clearing the registry settings alone is often not enough - the Windows Update Agent, BITS, and Group Policy can all keep referencing (or silently re-tattoo) the old server, which shows up as scan failures such as "There is no route or network connectivity to the endpoint" (0x80240438). The -ResetWindowsUpdateCache and -TestWindowsUpdateConnectivity switches address the two most common causes of that symptom once the registry is confirmed clean: a stale local Windows Update cache, and outbound firewall/proxy rules that only ever allowed traffic to the internal WSUS server.
 
 .PARAMETER CustomFieldName
     The name of the custom field to set with WSUS settings information.
@@ -12,10 +14,16 @@
 .PARAMETER RemoveWSUSSettings
     If specified, removes the WSUS policy registry key (the same key GPOs write WSUS settings to) after it has been detected and reported on. If no WSUS registry settings are found, no action is taken and this is reported.
 
+.PARAMETER ResetWindowsUpdateCache
+    If specified, stops the BITS, Windows Update, Cryptographic Services, and Update Orchestrator services, renames the SoftwareDistribution and catroot2 cache folders (Microsoft's documented Windows Update component reset), and restarts those services. This forces the Windows Update Agent to rebuild its cache and drop any stale/cached reference to a decommissioned WSUS server instead of continuing to use it until the next reboot. The next patch scan afterward will take longer than usual while the cache rebuilds.
+
+.PARAMETER TestWindowsUpdateConnectivity
+    If specified, tests DNS resolution and TCP connectivity to a representative set of Microsoft's published Windows Update, Delivery Optimization, and Automatic Root Certificate Update endpoints. Useful when an environment previously relied on WSUS exclusively and outbound firewall/proxy rules were never opened for direct internet access to Microsoft's update servers.
+
 .EXAMPLE
     (No Parameters)
 
-    [Info] Script Version: 1.8
+    [Info] Script Version: 1.9
     [Info] Updating group policies...
     [Info] Group policy update completed successfully.
 
@@ -37,7 +45,7 @@
 .EXAMPLE
     -CustomFieldName "WSUSSettings"
 
-    [Info] Script Version: 1.8
+    [Info] Script Version: 1.9
     [Info] Updating group policies...
     [Info] Group policy update completed successfully.
 
@@ -66,7 +74,7 @@
 .EXAMPLE
     -RemoveWSUSSettings -CustomFieldName "WSUSSettings"
 
-    [Info] Script Version: 1.8
+    [Info] Script Version: 1.9
     [Info] Checking the registry for WSUS settings...
     [Info] WSUS Update Server detected in the registry: https://test.local.another.sub.domain/test/testagain:8562
     [Info] WSUS Statistics Server detected in the registry: https://test.local.another.sub.domain/test/testagain:8562
@@ -92,10 +100,65 @@
 
     NOTE: the console output above shows the before/after (what was found, then that it was removed), while the custom field reflects only the end result of this run - "Not Configured" once the removal succeeded.
 
+.EXAMPLE
+    -RemoveWSUSSettings -ResetWindowsUpdateCache -TestWindowsUpdateConnectivity -CustomFieldName "WSUSSettings"
+
+    [Info] Script Version: 1.9
+    [Info] Checking the registry for WSUS settings...
+    [Info] WSUS Update Server detected in the registry: https://test.local.another.sub.domain/test/testagain:8562
+    [Info] WSUS Statistics Server detected in the registry: https://test.local.another.sub.domain/test/testagain:8562
+
+    ### Active WSUS settings: ###
+
+    WSUS Settings Source : Registry
+    WSUS Status          : Enabled
+    Update Server        : https://test.local.another.sub.domain/test/testagain:8562
+    Statistics Server    : https://test.local.another.sub.domain/test/testagain:8562
+
+    [Info] Testing connectivity to Windows Update endpoints...
+    [Warning] Unable to reach ctldl.windowsupdate.com on port 80. This can indicate a firewall or proxy blocking Windows Update traffic.
+    [Warning] Unable to reach download.windowsupdate.com on port 80. This can indicate a firewall or proxy blocking Windows Update traffic.
+    [Info] Reachable: sls.update.microsoft.com:443
+    [Info] Reachable: fe3.delivery.mp.microsoft.com:443
+    [Info] Reachable: dl.delivery.mp.microsoft.com:80
+    [Info] Reachable: geo.prod.do.dsp.mp.microsoft.com:443
+    [Info] Reachable: tsfe.trafficshaping.dsp.mp.microsoft.com:443
+    [Info] Reachable: adl.windows.com:80
+    [Warning] 2 of 8 Windows Update endpoints could not be reached. If this device previously relied on WSUS exclusively, outbound firewall/proxy rules may need to be updated to allow direct access to Microsoft's update servers.
+
+    [Info] Removing WSUS settings from the registry...
+    [Info] Removing WSUS registry settings at 'HKLM:\Software\Policies\Microsoft\Windows\WindowsUpdate'...
+    [Info] Successfully removed WSUS registry settings at 'HKLM:\Software\Policies\Microsoft\Windows\WindowsUpdate'.
+    [Info] Restarting the 'wuauserv' service so Windows Update picks up the change...
+    [Info] Successfully restarted the 'wuauserv' service.
+    [Info] Restarting the 'bits' service so Windows Update picks up the change...
+    [Info] Successfully restarted the 'bits' service.
+    [Info] Restarting the 'UsoSvc' service so Windows Update picks up the change...
+    [Info] Successfully restarted the 'UsoSvc' service.
+
+    [Info] Resetting the Windows Update cache...
+    [Info] Stopping the 'bits' service...
+    [Info] Stopping the 'wuauserv' service...
+    [Info] Stopping the 'cryptsvc' service...
+    [Info] Stopping the 'UsoSvc' service...
+    [Info] Renamed 'C:\Windows\SoftwareDistribution' to 'C:\Windows\SoftwareDistribution.bak_20260714120000'.
+    [Info] Renamed 'C:\Windows\System32\catroot2' to 'C:\Windows\System32\catroot2.bak_20260714120000'.
+    [Info] Starting the 'bits' service...
+    [Info] Starting the 'wuauserv' service...
+    [Info] Starting the 'cryptsvc' service...
+    [Info] Starting the 'UsoSvc' service...
+
+    [Info] Setting the custom field 'WSUSSettings' with the value:
+    WSUS Status: Not Configured | WU Connectivity: 6/8 reachable | Cache Reset: Completed
+    [Info] Successfully set the custom field 'WSUSSettings'.
+
 .NOTES
     Minimum OS Architecture Supported: Windows 10, Windows Server 2016
-    Version: 1.8
+    Version: 1.9
     Release Notes:
+    - Added -ResetWindowsUpdateCache (Ninja checkbox: resetWindowsUpdateCache), which follows Microsoft's documented manual reset procedure (stop BITS/wuauserv/cryptsvc, rename SoftwareDistribution and catroot2, restart the services): https://learn.microsoft.com/en-us/troubleshoot/windows-client/installing-updates-features-roles/additional-resources-for-windows-update. UsoSvc (Update Orchestrator) is stopped/started alongside them since it also holds update state in memory. Folders are renamed with a timestamp suffix rather than deleted, so a rollback is possible if needed. Deliberately does NOT perform the more aggressive legacy steps some public "WU reset" scripts include (re-registering WU/BITS DLLs via regsvr32, `netsh winsock reset`, resetting the BITS/wuauserv service ACLs via `sc.exe sdset`) - Microsoft's own guidance calls those a last resort only if the folder-rename step doesn't resolve the issue, they predate Windows 10's servicing model, and the ACL reset in particular is irreversible without a backup.
+    - Added -TestWindowsUpdateConnectivity (Ninja checkbox: testWindowsUpdateConnectivity), which checks DNS resolution and TCP connectivity against 8 literal (non-wildcard) hostnames Microsoft documents across the Windows Update, Delivery Optimization, and Automatic Root Certificate Update endpoint families (ctldl.windowsupdate.com, download.windowsupdate.com, sls.update.microsoft.com, fe3.delivery.mp.microsoft.com, dl.delivery.mp.microsoft.com, geo.prod.do.dsp.mp.microsoft.com, tsfe.trafficshaping.dsp.mp.microsoft.com, adl.windows.com) - see https://learn.microsoft.com/en-us/troubleshoot/windows-client/installing-updates-features-roles/windows-update-issues-troubleshooting#device-cant-access-update-files. Most of Microsoft's published endpoints are wildcards (e.g. `*.windowsupdate.com`) and Microsoft doesn't publish IP ranges, so these are representative samples of each family rather than an exhaustive allowlist test. This targets the "environment was firewalled to only allow the old WSUS server" failure mode directly, since a device that's had its WSUS settings removed still needs a clear path to Microsoft's servers to resume scanning.
+    - Added "bits" to the list of services restarted after -RemoveWSUSSettings succeeds, alongside the existing wuauserv/UsoSvc restart, since BITS can also hold a queued/in-progress download job pointed at the old WSUS server's URL.
     - Added -RemoveWSUSSettings (Ninja checkbox: removeWsusSettings) to delete the WSUS policy registry key after detection/reporting.
     - After a successful removal, restarts the wuauserv and UsoSvc services so the Windows Update Agent drops any WSUS endpoint it already had cached in memory instead of continuing to use it until the next reboot. Without this, a patch scan run immediately after removal could still fail trying to reach the now-deleted server (e.g. WU_E-style "no route or network connectivity to the endpoint" errors) even though the registry itself was already clean.
     - Removal now runs before the custom field is written, and the registry is re-checked afterward so the custom field reports the actual end result of the run (e.g. "Not Configured" after a successful removal) rather than the pre-removal snapshot. The console output still shows the full before/after detail; only the custom field was changed to reflect the final state. GPO Name / Applied GPOs attribution is still sourced from the pre-removal scan, since that context doesn't change based on whether the registry was just cleared.
@@ -107,17 +170,20 @@
 
     Imported from Ninja 4/15/2026 BBJr
     Modified to include removal of WSUS settings and GPOs in registry, Local GPO detection, and applied-GPO attribution reporting 7/8/2026 BBJr
+    Modified to include Windows Update cache reset and Windows Update endpoint connectivity testing 7/14/2026 BBJr
 #>
 
 [CmdletBinding()]
 param (
     [string]$CustomFieldName,
-    [switch]$RemoveWSUSSettings
+    [switch]$RemoveWSUSSettings,
+    [switch]$ResetWindowsUpdateCache,
+    [switch]$TestWindowsUpdateConnectivity
 )
 begin {
     # Keep in sync with the Version value in the comment-based help .NOTES block above.
     # Printed first so NinjaOne activity logs always show which revision of the script actually ran - useful when a fix doesn't seem to have taken effect on an endpoint.
-    $ScriptVersion = "1.8"
+    $ScriptVersion = "1.9"
     Write-Host -Object "[Info] Script Version: $ScriptVersion"
 
     # Import custom field from script variable
@@ -125,6 +191,12 @@ begin {
 
     # Import the "Remove WSUS Settings" checkbox from script variable
     if ($env:removeWsusSettings -eq "true") { $RemoveWSUSSettings = $true }
+
+    # Import the "Reset Windows Update Cache" checkbox from script variable
+    if ($env:resetWindowsUpdateCache -eq "true") { $ResetWindowsUpdateCache = $true }
+
+    # Import the "Test Windows Update Connectivity" checkbox from script variable
+    if ($env:testWindowsUpdateConnectivity -eq "true") { $TestWindowsUpdateConnectivity = $true }
 
     # Validate the custom field name if provided
     if ($CustomFieldName) {
@@ -331,7 +403,8 @@ begin {
 
         # The Windows Update Agent can keep its update source cached in memory rather than reloading it as soon as the registry value disappears,
         # so restart the services that drive it to make sure it drops the stale (e.g. decommissioned WSUS) endpoint immediately instead of on the next reboot
-        foreach ($serviceName in "wuauserv", "UsoSvc") {
+        # bits is included alongside wuauserv/UsoSvc because it can also be holding a queued/in-progress download job pointed at the old WSUS server's URL
+        foreach ($serviceName in "wuauserv", "bits", "UsoSvc") {
             $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
             if (-not $service) { continue }
 
@@ -343,6 +416,133 @@ begin {
             catch {
                 Write-Host -Object "[Warning] Failed to restart the '$serviceName' service."
                 Write-Host -Object "[Warning] $($_.Exception.Message)"
+            }
+        }
+    }
+
+    # Function to reset the Windows Update cache, following Microsoft's documented manual reset procedure:
+    # https://learn.microsoft.com/en-us/troubleshoot/windows-client/installing-updates-features-roles/additional-resources-for-windows-update
+    # Deliberately does not perform the more aggressive steps from that article (regsvr32 re-registration of WU/BITS DLLs, netsh winsock reset, sc.exe sdset ACL reset) -
+    # Microsoft calls those a last resort only if the folder rename doesn't help, they're carried over from pre-Windows 10 troubleshooting, and the ACL reset can't be undone without a backup
+    function Reset-WindowsUpdateCache {
+        [CmdletBinding()]
+        param ()
+
+        $timestamp = Get-Date -Format "yyyyMMddHHmmss"
+        $success = $true
+
+        # These three are the services Microsoft's own reset guidance stops before renaming the cache folders.
+        # UsoSvc (Update Orchestrator) is included too since it holds update state in memory, same reasoning as the service restart after -RemoveWSUSSettings above
+        $servicesToCycle = "bits", "wuauserv", "cryptsvc", "UsoSvc"
+
+        foreach ($serviceName in $servicesToCycle) {
+            $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+            if (-not $service) { continue }
+
+            try {
+                Write-Host -Object "[Info] Stopping the '$serviceName' service..."
+                Stop-Service -Name $serviceName -Force -ErrorAction Stop
+            }
+            catch {
+                Write-Host -Object "[Error] Failed to stop the '$serviceName' service."
+                Write-Host -Object "[Error] $($_.Exception.Message)"
+                $script:ExitCode = 1
+                $success = $false
+            }
+        }
+
+        # Renaming (rather than deleting) preserves the option to roll back, and matches Microsoft's own documented reset steps
+        $foldersToRename = @(
+            [PSCustomObject]@{ Path = "$env:SystemRoot\SoftwareDistribution"; NewName = "SoftwareDistribution.bak_$timestamp" }
+            [PSCustomObject]@{ Path = "$env:SystemRoot\System32\catroot2"; NewName = "catroot2.bak_$timestamp" }
+        )
+
+        foreach ($folder in $foldersToRename) {
+            if (!(Test-Path -Path $folder.Path)) {
+                Write-Host -Object "[Info] '$($folder.Path)' does not exist; nothing to rename."
+                continue
+            }
+
+            try {
+                Rename-Item -Path $folder.Path -NewName $folder.NewName -ErrorAction Stop
+                Write-Host -Object "[Info] Renamed '$($folder.Path)' to '$(Join-Path -Path (Split-Path -Path $folder.Path -Parent) -ChildPath $folder.NewName)'."
+            }
+            catch {
+                Write-Host -Object "[Error] Failed to rename '$($folder.Path)'."
+                Write-Host -Object "[Error] $($_.Exception.Message)"
+                $script:ExitCode = 1
+                $success = $false
+            }
+        }
+
+        foreach ($serviceName in $servicesToCycle) {
+            $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+            if (-not $service) { continue }
+
+            try {
+                Write-Host -Object "[Info] Starting the '$serviceName' service..."
+                Start-Service -Name $serviceName -ErrorAction Stop
+            }
+            catch {
+                Write-Host -Object "[Error] Failed to start the '$serviceName' service."
+                Write-Host -Object "[Error] $($_.Exception.Message)"
+                $script:ExitCode = 1
+                $success = $false
+            }
+        }
+
+        return $success
+    }
+
+    # Function to test DNS resolution and TCP connectivity to a representative sample of Microsoft's published Windows Update / Delivery Optimization / Automatic Root
+    # Certificate Update endpoints. Most of the endpoints Microsoft documents are wildcards (e.g. *.windowsupdate.com) and Microsoft doesn't publish IP ranges for them,
+    # so these are literal, non-wildcard hostnames confirmed live and drawn from:
+    # https://learn.microsoft.com/en-us/troubleshoot/windows-client/installing-updates-features-roles/windows-update-issues-troubleshooting#device-cant-access-update-files
+    # https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/privacy/manage-windows-2004-endpoints
+    function Test-WindowsUpdateConnectivity {
+        [CmdletBinding()]
+        param ()
+
+        $endpoints = @(
+            [PSCustomObject]@{ Hostname = "ctldl.windowsupdate.com"; Port = 80 }
+            [PSCustomObject]@{ Hostname = "download.windowsupdate.com"; Port = 80 }
+            [PSCustomObject]@{ Hostname = "sls.update.microsoft.com"; Port = 443 }
+            [PSCustomObject]@{ Hostname = "fe3.delivery.mp.microsoft.com"; Port = 443 }
+            [PSCustomObject]@{ Hostname = "dl.delivery.mp.microsoft.com"; Port = 80 }
+            [PSCustomObject]@{ Hostname = "geo.prod.do.dsp.mp.microsoft.com"; Port = 443 }
+            [PSCustomObject]@{ Hostname = "tsfe.trafficshaping.dsp.mp.microsoft.com"; Port = 443 }
+            [PSCustomObject]@{ Hostname = "adl.windows.com"; Port = 80 }
+        )
+
+        foreach ($endpoint in $endpoints) {
+            $dnsResolved = $false
+            $tcpConnected = $false
+
+            try {
+                $null = Resolve-DnsName -Name $endpoint.Hostname -ErrorAction Stop
+                $dnsResolved = $true
+            }
+            catch {
+                # A DNS failure here corresponds to WU_E_PT_WINHTTP_NAME_NOT_RESOLVED (0x8024402C) and usually points to a DNS server or proxy PAC issue rather than a firewall block
+            }
+
+            if ($dnsResolved) {
+                try {
+                    $tcpClient = [System.Net.Sockets.TcpClient]::new()
+                    $connectTask = $tcpClient.ConnectAsync($endpoint.Hostname, $endpoint.Port)
+                    $tcpConnected = $connectTask.Wait(5000) -and $tcpClient.Connected
+                    $tcpClient.Close()
+                }
+                catch {
+                    $tcpConnected = $false
+                }
+            }
+
+            [PSCustomObject]@{
+                Hostname     = $endpoint.Hostname
+                Port         = $endpoint.Port
+                DNSResolved  = $dnsResolved
+                TCPConnected = $tcpConnected
             }
         }
     }
@@ -828,10 +1028,47 @@ process {
         }
     }
 
+    # If requested, test connectivity to Microsoft's Windows Update endpoints. Independent of the registry/GPO state above, since it's checking whether the network path to
+    # Microsoft is even open - relevant both before and after -RemoveWSUSSettings, since an environment that only ever firewalled traffic to the internal WSUS server will
+    # still fail to reach Microsoft even with a perfectly clean registry
+    $connectivityResults = $null
+    if ($TestWindowsUpdateConnectivity) {
+        Write-Host -Object "`n[Info] Testing connectivity to Windows Update endpoints..."
+        $connectivityResults = Test-WindowsUpdateConnectivity
+
+        foreach ($result in $connectivityResults) {
+            if ($result.TCPConnected) {
+                Write-Host -Object "[Info] Reachable: $($result.Hostname):$($result.Port)"
+            } elseif (-not $result.DNSResolved) {
+                Write-Host -Object "[Warning] DNS resolution failed for $($result.Hostname). This can indicate a DNS server or proxy configuration issue."
+            } else {
+                Write-Host -Object "[Warning] Unable to reach $($result.Hostname) on port $($result.Port). This can indicate a firewall or proxy blocking Windows Update traffic."
+            }
+        }
+
+        # Wrapped in @() so Where-Object returning zero or one match still yields a real array - otherwise a zero-match result is $null and $null.Count silently renders as blank instead of 0
+        $unreachableEndpoints = @($connectivityResults | Where-Object { -not $_.TCPConnected })
+        $reachableCount = @($connectivityResults | Where-Object { $_.TCPConnected }).Count
+        $totalEndpointCount = @($connectivityResults).Count
+
+        if ($unreachableEndpoints) {
+            Write-Host -Object "[Warning] $($unreachableEndpoints.Count) of $totalEndpointCount Windows Update endpoints could not be reached. If this device previously relied on WSUS exclusively, outbound firewall/proxy rules may need to be updated to allow direct access to Microsoft's update servers."
+        } else {
+            Write-Host -Object "[Info] All $totalEndpointCount tested Windows Update endpoints are reachable."
+        }
+    }
+
     # If requested, remove the WSUS settings from the registry. This runs before the custom field is written, since the field should reflect the end result of this run, not the pre-removal snapshot already shown above
     if ($RemoveWSUSSettings) {
         Write-Host -Object "`n[Info] Removing WSUS settings from the registry..."
         Remove-WSUSRegistrySettings -Path $wsusRegPath
+    }
+
+    # If requested, reset the Windows Update cache so the agent rebuilds it from scratch instead of continuing to reference anything tied to the old WSUS server
+    $cacheResetSucceeded = $null
+    if ($ResetWindowsUpdateCache) {
+        Write-Host -Object "`n[Info] Resetting the Windows Update cache..."
+        $cacheResetSucceeded = Reset-WindowsUpdateCache
     }
 
     # Re-check the live registry for the final WSUS state. If nothing was removed above, this simply confirms what was already detected; if removal ran, this reflects whether it actually took
@@ -880,6 +1117,17 @@ process {
         # Add the currently applied GPOs for attribution/troubleshooting, if they were retrieved
         if ($appliedGPOs) {
             [void]$customFieldValue.Append(" | Applied GPOs: $($appliedGPOs -join ', ')")
+        }
+
+        # Add the Windows Update endpoint connectivity results, if the check was requested. Only the count is included here (the full per-endpoint
+        # breakdown is already in the console output above) since NinjaOne text custom fields commonly cap out at 200 characters
+        if ($connectivityResults) {
+            [void]$customFieldValue.Append(" | WU Connectivity: $reachableCount/$totalEndpointCount reachable")
+        }
+
+        # Add the Windows Update cache reset result, if it was requested
+        if ($null -ne $cacheResetSucceeded) {
+            [void]$customFieldValue.Append(" | Cache Reset: $(if ($cacheResetSucceeded) { 'Completed' } else { 'Failed' })")
         }
 
         # Set the custom field
