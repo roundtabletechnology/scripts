@@ -20,10 +20,13 @@
 .PARAMETER TestWindowsUpdateConnectivity
     If specified, tests DNS resolution and TCP connectivity to a representative set of Microsoft's published Windows Update, Delivery Optimization, and Automatic Root Certificate Update endpoints. Useful when an environment previously relied on WSUS exclusively and outbound firewall/proxy rules were never opened for direct internet access to Microsoft's update servers.
 
+.PARAMETER UnregisterStaleUpdateServices
+    If specified, unregisters any stale WSUS/third-party update service that is still bound to the Windows Update Agent (as surfaced by the service-binding inspection) via the Microsoft.Update.ServiceManager COM API. This is the fix for a WSUS service that remains the DefaultAUService even after every WSUS registry value and GPO has been removed - a state that -ResetWindowsUpdateCache does NOT clear, because the service registration lives outside the SoftwareDistribution cache folder. Removing it makes the agent fall back to the built-in Windows Update / Microsoft Update service so scans stop failing 0x80240438 against a server that no longer exists.
+
 .EXAMPLE
     (No Parameters)
 
-    [Info] Script Version: 1.9
+    [Info] Script Version: 1.12
     [Info] Updating group policies...
     [Info] Group policy update completed successfully.
 
@@ -45,7 +48,7 @@
 .EXAMPLE
     -CustomFieldName "WSUSSettings"
 
-    [Info] Script Version: 1.9
+    [Info] Script Version: 1.12
     [Info] Updating group policies...
     [Info] Group policy update completed successfully.
 
@@ -74,7 +77,7 @@
 .EXAMPLE
     -RemoveWSUSSettings -CustomFieldName "WSUSSettings"
 
-    [Info] Script Version: 1.9
+    [Info] Script Version: 1.12
     [Info] Checking the registry for WSUS settings...
     [Info] WSUS Update Server detected in the registry: https://test.local.another.sub.domain/test/testagain:8562
     [Info] WSUS Statistics Server detected in the registry: https://test.local.another.sub.domain/test/testagain:8562
@@ -103,7 +106,7 @@
 .EXAMPLE
     -RemoveWSUSSettings -ResetWindowsUpdateCache -TestWindowsUpdateConnectivity -CustomFieldName "WSUSSettings"
 
-    [Info] Script Version: 1.9
+    [Info] Script Version: 1.12
     [Info] Checking the registry for WSUS settings...
     [Info] WSUS Update Server detected in the registry: https://test.local.another.sub.domain/test/testagain:8562
     [Info] WSUS Statistics Server detected in the registry: https://test.local.another.sub.domain/test/testagain:8562
@@ -154,8 +157,18 @@
 
 .NOTES
     Minimum OS Architecture Supported: Windows 10, Windows Server 2016
-    Version: 1.9
+    Version: 1.12
     Release Notes:
+    - Fixed the custom field (and console) reporting "WSUS Status: Not Configured" on a device where the Windows Update Agent was clearly still bound to a WSUS service. The policy registry can read "Not Configured" while a *managed* WSUS registration lives in the agent's datastore - and that binding, not the empty policy key, is what a scan actually uses. The report now leads with an EFFECTIVE WSUS state ("Bound to service (<name>)" when a WSUS/third-party service is still bound, otherwise the policy state), and the previously separate, contradictory "Bound Non-MS Service" field is folded into that headline.
+    - Added a domain-controller reachability check (Test-DomainControllerReachable via nltest /dsgetdc) reported as context only - it NEVER gates the remediation switches, so local cleanup still runs on a decommissioned-domain client. It appears in the console and as "DC: Reachable/Unreachable" in the custom field, and explains the common real-world cause (a roaming laptop off the corporate network/VPN, or a dead domain) for why a managed WSUS binding can't clear on a given run.
+    - Corrected the guidance the script prints about a bound WSUS service. A *managed* WSUS binding does NOT clear by removing the registry settings or resetting the cache (the earlier "-ResetWindowsUpdateCache will clear it" advice was wrong); it clears only when the device completes a Group Policy cycle against a reachable domain controller with no WSUS configured, or when the device is removed from the domain. The -UnregisterStaleUpdateServices result is now reported as "Cleared" or "Blocked-NeedsDC/Domain" based on whether the binding is actually gone after the attempt, rather than on the COM call's return.
+    - A managed WSUS service that can't be unregistered locally (the agent returns 0x8024801A) is now reported as a Warning and no longer sets a non-zero exit code / fails the whole NinjaOne action, since it's an environmental limitation (domain-managed) rather than a script error. -UnregisterStaleUpdateServices deliberately uses only non-blocking COM calls (RemoveService / AddService2) and never UnregisterServiceWithAU, which blocks trying to reach a decommissioned WSUS endpoint.
+    - Added -UnregisterStaleUpdateServices (Ninja checkbox: unregisterStaleUpdateServices), the targeted fix for a WSUS service that stays bound to the Windows Update Agent as the DefaultAUService even after every WSUS registry value and GPO is gone. This state does NOT clear with -ResetWindowsUpdateCache: renaming SoftwareDistribution was confirmed in the field to leave the WSUS service registered and still the default, so the datastore is not where that binding lives. The new switch uses Microsoft.Update.ServiceManager.RemoveService to unregister each service the binding inspection flagged as a concern (falling back to registering Microsoft Update with AU first, then retrying, if the service refuses direct removal because AU treats it as the default), then restarts wuauserv/UsoSvc. After the action it re-audits the bound services and reports whether the WSUS binding is actually gone ("Cleared"), still present pending a reboot ("Reboot Pending"), or failed - both to the console and the custom field.
+    - Fixed Reset-WindowsUpdateCache reporting "Cache Reset: Failed" (and failing the whole NinjaOne action) when only a service stop/start hiccupped while the cache folders actually renamed successfully. cryptsvc in particular frequently refuses to stop (dependent services / auto-restart) yet catroot2 still renames. Service stop/start problems are now warnings and no longer set the failure flag or exit code; only a genuine folder-rename failure marks the reset failed.
+    - Fixed the NinjaOne custom field write failing with "Value length should be less than 200 characters" (which failed the entire action) when the assembled value exceeded the field's 200-character limit - the newly added Scan Blockers / Bound Non-MS Service fields could push a long applied-GPO list over the edge. The value is now truncated to 199 characters with an ellipsis, and the fields are appended in priority order (WSUS state, scan blockers, bound service, remediation results first; the verbose applied-GPO list last) so truncation drops the least actionable detail first.
+    - Added a full-value inspection of the Windows Update policy key (Get-WindowsUpdatePolicyDiagnostics), run on every pass. The main WSUS check only reads UseWUServer/WUServer/WUStatusServer, but the same key can carry OTHER values that independently cause 0x80240438 ("no route or network connectivity to the endpoint") even when WSUS reports "Not Configured" - so a clean WSUS audit was hiding the value actually blocking the scan. It now enumerates every value under the key and its AU subkey and flags the known scan-blockers: DoNotConnectToWindowsUpdateInternetLocations, DisableWindowsUpdateAccess, DisableDualScan, the four SetPolicyDrivenUpdateSourceFor* Dual Scan overrides, and UseUpdateClassPolicySource (each only counted as a blocker when set non-zero). Blocker names are appended to the custom field as "Scan Blockers: ...".
+    - Added an inspection of which update service the Windows Update Agent is actually bound to (Get-RegisteredUpdateServices via the Microsoft.Update.ServiceManager COM API), run on every pass. This binding lives in the agent's datastore (the SoftwareDistribution folder), NOT in the policy registry, so a WSUS service the agent registered years ago can remain the active scan source long after every WSUS registry value and GPO has been cleaned up - and keeps failing 0x80240438 against a server that no longer exists. Any service that isn't a known-Microsoft one (matched by service ID, including the well-known WSUS service ID 3da21691-e39d-4da6-8a4b-b43877bcb1b7) is flagged, along with its ServiceUrl and AU registration flags, with a pointer to -ResetWindowsUpdateCache as the fix. A stale binding is appended to the custom field as "Bound Non-MS Service: ...".
+    - Both new checks are read-only and always run (no new Ninja checkbox), and are placed before the -RemoveWSUSSettings/-ResetWindowsUpdateCache actions so they report the pre-remediation state - i.e. what the removal and cache reset are about to clear.
     - Added -ResetWindowsUpdateCache (Ninja checkbox: resetWindowsUpdateCache), which follows Microsoft's documented manual reset procedure (stop BITS/wuauserv/cryptsvc, rename SoftwareDistribution and catroot2, restart the services): https://learn.microsoft.com/en-us/troubleshoot/windows-client/installing-updates-features-roles/additional-resources-for-windows-update. UsoSvc (Update Orchestrator) is stopped/started alongside them since it also holds update state in memory. Folders are renamed with a timestamp suffix rather than deleted, so a rollback is possible if needed. Deliberately does NOT perform the more aggressive legacy steps some public "WU reset" scripts include (re-registering WU/BITS DLLs via regsvr32, `netsh winsock reset`, resetting the BITS/wuauserv service ACLs via `sc.exe sdset`) - Microsoft's own guidance calls those a last resort only if the folder-rename step doesn't resolve the issue, they predate Windows 10's servicing model, and the ACL reset in particular is irreversible without a backup.
     - Added -TestWindowsUpdateConnectivity (Ninja checkbox: testWindowsUpdateConnectivity), which checks DNS resolution and TCP connectivity against 8 literal (non-wildcard) hostnames Microsoft documents across the Windows Update, Delivery Optimization, and Automatic Root Certificate Update endpoint families (ctldl.windowsupdate.com, download.windowsupdate.com, sls.update.microsoft.com, fe3.delivery.mp.microsoft.com, dl.delivery.mp.microsoft.com, geo.prod.do.dsp.mp.microsoft.com, tsfe.trafficshaping.dsp.mp.microsoft.com, adl.windows.com) - see https://learn.microsoft.com/en-us/troubleshoot/windows-client/installing-updates-features-roles/windows-update-issues-troubleshooting#device-cant-access-update-files. Most of Microsoft's published endpoints are wildcards (e.g. `*.windowsupdate.com`) and Microsoft doesn't publish IP ranges, so these are representative samples of each family rather than an exhaustive allowlist test. This targets the "environment was firewalled to only allow the old WSUS server" failure mode directly, since a device that's had its WSUS settings removed still needs a clear path to Microsoft's servers to resume scanning.
     - Added "bits" to the list of services restarted after -RemoveWSUSSettings succeeds, alongside the existing wuauserv/UsoSvc restart, since BITS can also hold a queued/in-progress download job pointed at the old WSUS server's URL.
@@ -171,6 +184,9 @@
     Imported from Ninja 4/15/2026 BBJr
     Modified to include removal of WSUS settings and GPOs in registry, Local GPO detection, and applied-GPO attribution reporting 7/8/2026 BBJr
     Modified to include Windows Update cache reset and Windows Update endpoint connectivity testing 7/14/2026 BBJr
+    Modified to include full Windows Update policy-value inspection and registered update-service (datastore binding) inspection 7/22/2026 BBJr
+    Modified to add -UnregisterStaleUpdateServices remediation, fix a false cache-reset failure on cryptsvc, and truncate the custom field to NinjaOne's 200-char limit 7/22/2026 BBJr
+    Modified to report the EFFECTIVE WSUS state (bound managed service vs. policy), add DC-reachability context without gating remediation, and stop failing the action over a managed binding that can't be removed locally 7/22/2026 BBJr
 #>
 
 [CmdletBinding()]
@@ -178,12 +194,13 @@ param (
     [string]$CustomFieldName,
     [switch]$RemoveWSUSSettings,
     [switch]$ResetWindowsUpdateCache,
-    [switch]$TestWindowsUpdateConnectivity
+    [switch]$TestWindowsUpdateConnectivity,
+    [switch]$UnregisterStaleUpdateServices
 )
 begin {
     # Keep in sync with the Version value in the comment-based help .NOTES block above.
     # Printed first so NinjaOne activity logs always show which revision of the script actually ran - useful when a fix doesn't seem to have taken effect on an endpoint.
-    $ScriptVersion = "1.9"
+    $ScriptVersion = "1.12"
     Write-Host -Object "[Info] Script Version: $ScriptVersion"
 
     # Import custom field from script variable
@@ -197,6 +214,9 @@ begin {
 
     # Import the "Test Windows Update Connectivity" checkbox from script variable
     if ($env:testWindowsUpdateConnectivity -eq "true") { $TestWindowsUpdateConnectivity = $true }
+
+    # Import the "Unregister Stale Update Services" checkbox from script variable
+    if ($env:unregisterStaleUpdateServices -eq "true") { $UnregisterStaleUpdateServices = $true }
 
     # Validate the custom field name if provided
     if ($CustomFieldName) {
@@ -444,10 +464,11 @@ begin {
                 Stop-Service -Name $serviceName -Force -ErrorAction Stop
             }
             catch {
-                Write-Host -Object "[Error] Failed to stop the '$serviceName' service."
-                Write-Host -Object "[Error] $($_.Exception.Message)"
-                $script:ExitCode = 1
-                $success = $false
+                # A service that won't stop (cryptsvc is the usual culprit - other services depend on it, or it auto-restarts) is not by itself
+                # fatal: the folder rename below often still succeeds. Treat it as a warning and let the rename result decide overall success,
+                # rather than failing the whole reset (and the NinjaOne action) over a service that didn't need to be down for the rename to work.
+                Write-Host -Object "[Warning] Could not stop the '$serviceName' service; continuing. If a cache folder fails to rename below, this is the likely cause."
+                Write-Host -Object "[Warning] $($_.Exception.Message)"
             }
         }
 
@@ -484,10 +505,10 @@ begin {
                 Start-Service -Name $serviceName -ErrorAction Stop
             }
             catch {
-                Write-Host -Object "[Error] Failed to start the '$serviceName' service."
-                Write-Host -Object "[Error] $($_.Exception.Message)"
-                $script:ExitCode = 1
-                $success = $false
+                # These services are demand/trigger-start; Windows brings them back automatically on the next update operation. Don't fail the
+                # reset over a start hiccup - the cache rename (the actual point of the reset) is what determines success.
+                Write-Host -Object "[Warning] Could not start the '$serviceName' service; Windows will start it on demand at the next update operation."
+                Write-Host -Object "[Warning] $($_.Exception.Message)"
             }
         }
 
@@ -592,6 +613,227 @@ begin {
         }
 
         return $appliedGPOs
+    }
+
+    # Function to enumerate ALL values under the Windows Update policy key and its AU subkey, and flag the ones known to block or redirect a scan.
+    # The main WSUS check only inspects UseWUServer/WUServer/WUStatusServer, but several OTHER policy values in this same key can independently
+    # cause "There is no route or network connectivity to the endpoint" (0x80240438) even when no WSUS server address is set - most commonly the
+    # Dual Scan overrides that force an intranet/managed scan source, or a policy that blocks access to Windows Update on the internet entirely.
+    # This is exactly the case a "WSUS is Not Configured" audit hides: the key still exists and still carries a value that stops the scan.
+    function Get-WindowsUpdatePolicyDiagnostics {
+        [CmdletBinding()]
+        param (
+            [Parameter(Mandatory = $True)]
+            [string]$Path
+        )
+
+        if (!(Test-Path -Path $Path)) {
+            return $null
+        }
+
+        # Value names known to redirect the scan to a (now-missing) intranet source, or to block the internet path, when present and non-zero.
+        # Keyed by the friendly description shown when the value is a blocker.
+        $blockingValues = [ordered]@{
+            "DoNotConnectToWindowsUpdateInternetLocations" = "Blocks the device from contacting Windows Update on the internet (it may only use an intranet WSUS server, which no longer exists)."
+            "DisableWindowsUpdateAccess"                   = "Removes access to all Windows Update features, which prevents the agent from scanning."
+            "DisableDualScan"                              = "Forces scanning against the configured intranet/WSUS source only, blocking the fallback to Windows Update on the internet."
+            "SetPolicyDrivenUpdateSourceForFeatureUpdates" = "Forces feature updates to come from the intranet/WSUS source only."
+            "SetPolicyDrivenUpdateSourceForQualityUpdates" = "Forces quality updates to come from the intranet/WSUS source only."
+            "SetPolicyDrivenUpdateSourceForDriverUpdates"  = "Forces driver updates to come from the intranet/WSUS source only."
+            "SetPolicyDrivenUpdateSourceForOtherUpdates"   = "Forces other updates to come from the intranet/WSUS source only."
+            "UseUpdateClassPolicySource"                   = "Enables the per-update-class scan source policies above."
+        }
+
+        $findings = New-Object System.Collections.Generic.List[object]
+
+        foreach ($subPath in $Path, "$Path\AU") {
+            if (!(Test-Path -Path $subPath)) { continue }
+
+            $props = Get-ItemProperty -Path $subPath -ErrorAction SilentlyContinue
+            if (-not $props) { continue }
+
+            # Enumerate the actual value names present under the key, excluding PowerShell's PS* housekeeping properties
+            $valueNames = ($props.PSObject.Properties | Where-Object { $_.Name -notmatch "^PS(Path|ParentPath|ChildName|Provider|Drive)$" }).Name
+
+            foreach ($valueName in $valueNames) {
+                $value = $props.$valueName
+
+                # Only treat a known value as a blocker when it's actually enabled (non-zero); a value explicitly set to 0 is benign
+                $isBlocker = $blockingValues.Contains($valueName) -and $value -ne 0
+
+                $findings.Add([PSCustomObject]@{
+                    Key         = $subPath
+                    Name        = $valueName
+                    Value       = $value
+                    IsBlocker   = $isBlocker
+                    Explanation = if ($isBlocker) { $blockingValues[$valueName] } else { $null }
+                })
+            }
+        }
+
+        return $findings
+    }
+
+    # Function to enumerate the update services the Windows Update Agent is actually bound to. This state lives in the agent's datastore
+    # (the SoftwareDistribution folder), NOT in the policy registry key, so a WSUS service the agent registered years ago can remain the
+    # active scan source long after every WSUS *policy* value has been removed - producing 0x80240438 against an endpoint that no longer
+    # exists. Renaming SoftwareDistribution (-ResetWindowsUpdateCache) is what clears it; this surfaces whether that reset is still needed.
+    function Get-RegisteredUpdateServices {
+        [CmdletBinding()]
+        param ()
+
+        # Well-known Microsoft service IDs, so anything else can be flagged as a WSUS/third-party source.
+        # 3da21691-... is the "Windows Server Update Service" (WSUS) service ID - its presence is the direct sign of a WSUS binding.
+        $knownServices = @{
+            "9482f4b4-e343-43b6-b170-9a65bc822c77" = "Windows Update"
+            "7971f918-a847-4430-9279-4a52d1efe18d" = "Microsoft Update"
+            "855e8a7c-ecb4-4ca3-b045-1dfa50104289" = "Windows Store"
+            "117cab2d-82b1-4b5a-a08c-4d62dbee7782" = "Windows Store (DCat Prod)"
+            "3da21691-e39d-4da6-8a4b-b43877bcb1b7" = "Windows Server Update Service (WSUS)"
+        }
+
+        try {
+            $serviceManager = New-Object -ComObject "Microsoft.Update.ServiceManager"
+        } catch {
+            Write-Host -Object "[Warning] Unable to query the Windows Update service manager (Microsoft.Update.ServiceManager)."
+            Write-Host -Object "[Warning] $($_.Exception.Message)"
+            return $null
+        }
+
+        $services = foreach ($service in $serviceManager.Services) {
+            # ServiceUrl / IsDefaultAUService come from IUpdateService2 (available on the script's minimum supported OS); guard each access anyway
+            # so one service that doesn't expose a property can't abort the whole enumeration
+            $serviceId = "$($service.ServiceID)".ToLower()
+            $serviceUrl = try { $service.ServiceUrl } catch { $null }
+            $isDefaultAU = try { [bool]$service.IsDefaultAUService } catch { $false }
+            $isRegisteredAU = [bool]$service.IsRegisteredWithAU
+
+            # A Microsoft-hosted service URL lives under one of these domains. A WSUS binding instead points at an intranet host (e.g. http://sbs:8530).
+            # We test the URL rather than allowlisting service IDs, since Microsoft ships several background services (DCat, Store, flighting) whose
+            # IDs vary across builds - flagging by "not a known ID" would produce false positives on a perfectly healthy device.
+            $isMicrosoftUrl = [string]::IsNullOrWhiteSpace($serviceUrl) -or $serviceUrl -match "(?i)\.(microsoft\.com|windowsupdate\.com|windows\.com)(/|:|$)"
+
+            # A service is the actual scan source only if AU is bound to it. That plus the WSUS service ID, or an AU-bound service with a
+            # non-Microsoft URL, is the signal that a stale WSUS/third-party source is what a scan is still failing against.
+            $isAUBound = $isDefaultAU -or $isRegisteredAU
+            $isConcern = ($serviceId -eq "3da21691-e39d-4da6-8a4b-b43877bcb1b7") -or ($isAUBound -and -not $isMicrosoftUrl)
+
+            [PSCustomObject]@{
+                Name               = $service.Name
+                ServiceID          = $serviceId
+                KnownName          = $knownServices[$serviceId]
+                IsDefaultAUService = $isDefaultAU
+                IsRegisteredWithAU = $isRegisteredAU
+                IsManaged          = [bool]$service.IsManaged
+                ServiceUrl         = $serviceUrl
+                IsWSUS             = $serviceId -eq "3da21691-e39d-4da6-8a4b-b43877bcb1b7"
+                IsConcern          = $isConcern
+            }
+        }
+
+        return $services
+    }
+
+    # Function to unregister a stale WSUS / third-party update service from the Windows Update Agent via the Microsoft.Update.ServiceManager COM API.
+    # This is the targeted remediation for the case Get-RegisteredUpdateServices surfaces: the WSUS service is still registered - and still the
+    # DefaultAUService - even though every WSUS registry value and GPO is gone. Renaming SoftwareDistribution (-ResetWindowsUpdateCache) does NOT
+    # clear this, because the service registration and the default-AU-service selection persist outside that folder. Removing the WSUS service
+    # makes the agent fall back to the built-in Windows Update service as its default, which is what a scan failing 0x80240438 needs.
+    function Remove-StaleUpdateServiceRegistration {
+        [CmdletBinding()]
+        param (
+            [Parameter(Mandatory = $True)]
+            [object[]]$Services
+        )
+
+        try {
+            $serviceManager = New-Object -ComObject "Microsoft.Update.ServiceManager"
+            $serviceManager.ClientApplicationID = "Check for WSUS Settings and remove.ps1"
+        } catch {
+            Write-Host -Object "[Error] Unable to create the Windows Update service manager to unregister stale services."
+            Write-Host -Object "[Error] $($_.Exception.Message)"
+            $script:ExitCode = 1
+            return $false
+        }
+
+        # Microsoft Update (includes Office and other Microsoft products, and is the source a patch-management scan usually expects) - registering
+        # it with AU establishes a valid non-WSUS default. Flags 7 = asfAllowPendingRegistration + asfAllowOnlineRegistration + asfRegisterServiceWithAU.
+        $microsoftUpdateId = "7971f918-a847-4430-9279-4a52d1efe18d"
+
+        $allRemoved = $true
+
+        foreach ($svc in $Services) {
+            try {
+                Write-Host -Object "[Info] Unregistering stale update service '$($svc.Name)' (ServiceID $($svc.ServiceID))..."
+                $serviceManager.RemoveService($svc.ServiceID)
+                Write-Host -Object "[Info] Successfully unregistered '$($svc.Name)'."
+            } catch {
+                # A service AU currently treats as the default can refuse direct removal. Establish Microsoft Update as an AU-registered default
+                # first (which displaces WSUS as the default service), then retry the removal once.
+                Write-Host -Object "[Warning] Direct removal of '$($svc.Name)' failed; registering Microsoft Update with Automatic Updates first, then retrying."
+                Write-Host -Object "[Warning] $($_.Exception.Message)"
+
+                try {
+                    $null = $serviceManager.AddService2($microsoftUpdateId, 7, "")
+                    Write-Host -Object "[Info] Registered Microsoft Update with Automatic Updates."
+                } catch {
+                    Write-Host -Object "[Warning] Failed to register Microsoft Update with Automatic Updates: $($_.Exception.Message)"
+                }
+
+                try {
+                    $serviceManager.RemoveService($svc.ServiceID)
+                    Write-Host -Object "[Info] Successfully unregistered '$($svc.Name)' on retry."
+                } catch {
+                    # A *managed* WSUS service can't be removed locally while the device is domain-joined - the agent returns 0x8024801A
+                    # (invalid operation) because it won't deregister the managed default service. That's an environmental limitation, not a
+                    # script failure, so report it as a warning WITHOUT failing the whole action; the post-remediation re-audit and the custom
+                    # field make the remaining binding explicit, and the console explains the DC/domain requirement to clear it.
+                    Write-Host -Object "[Warning] Could not unregister '$($svc.Name)' locally: $($_.Exception.Message)"
+                    Write-Host -Object "[Warning] This is expected for a managed WSUS binding on a domain-joined device - it clears via a Group Policy cycle against a reachable domain controller, or by removing the device from the domain."
+                    $allRemoved = $false
+                }
+            }
+        }
+
+        # Restart the agent so it re-reads its (now WSUS-free) service list and settles on the built-in default immediately, rather than on the next reboot
+        foreach ($serviceName in "wuauserv", "UsoSvc") {
+            $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+            if (-not $service) { continue }
+
+            try {
+                Restart-Service -Name $serviceName -Force -ErrorAction Stop
+            }
+            catch {
+                Write-Host -Object "[Warning] Could not restart the '$serviceName' service after unregistering; a reboot will finish applying the change."
+            }
+        }
+
+        return $allRemoved
+    }
+
+    # Function to quickly test whether a live domain controller for this machine's domain is currently reachable.
+    # Used purely as REPORTING CONTEXT - it never gates the remediation switches (an operator cleaning up a dead-domain client
+    # must still be able to run them). It explains whether a stale *managed* WSUS binding can be expected to clear on this run,
+    # since that requires a successful Group Policy cycle against a DC (or the device being removed from the domain).
+    function Test-DomainControllerReachable {
+        [CmdletBinding()]
+        param ()
+
+        try {
+            $domain = (Get-CimInstance -Class Win32_ComputerSystem -ErrorAction Stop).Domain
+        } catch {
+            return $false
+        }
+
+        if ([string]::IsNullOrWhiteSpace($domain)) { return $false }
+
+        try {
+            # nltest /dsgetdc locates a DC for the domain; a zero exit code means one answered
+            $null = & "$env:SystemRoot\System32\nltest.exe" "/dsgetdc:$domain" 2>&1
+            return ($LASTEXITCODE -eq 0)
+        } catch {
+            return $false
+        }
     }
 
     # Function to test if a device is domain-joined
@@ -717,6 +959,20 @@ process {
             Write-Host -Object "[Warning] Failed to update group policy. Results may not reflect the latest group policy settings."
         } else {
             Write-Host -Object "[Info] Group policy update completed successfully."
+        }
+    }
+
+    # Determine whether a domain controller is currently reachable. This is REPORTING CONTEXT ONLY - it never gates the remediation
+    # switches below, so an operator cleaning up a decommissioned-domain client can still run them. It explains whether a stale
+    # *managed* WSUS binding can be expected to clear on this run: clearing one requires a Group Policy cycle against a reachable DC,
+    # or the device leaving the domain. Common "unreachable" cases: a roaming laptop off the corporate network/VPN, or a dead domain.
+    $DomainControllerReachable = $null
+    if ($IsDomainJoined) {
+        $DomainControllerReachable = Test-DomainControllerReachable
+        if ($DomainControllerReachable) {
+            Write-Host -Object "`n[Info] A domain controller is reachable for this device's domain."
+        } else {
+            Write-Host -Object "`n[Warning] No domain controller is reachable for this device's domain (e.g. a roaming laptop off the corporate network/VPN, or a decommissioned domain). Group Policy cannot process, so a stale *managed* WSUS binding cannot be cleared on this run - but registry/policy cleanup and every requested action below still run normally."
         }
     }
 
@@ -1058,10 +1314,85 @@ process {
         }
     }
 
+    # Inspect the FULL contents of the Windows Update policy key, not just the WSUS server trio checked above. Several other policy values in
+    # this same key can independently cause 0x80240438 ("no route or network connectivity to the endpoint") even after every WSUS server value
+    # is gone, so a "WSUS is Not Configured" result can still hide the value that's actually stopping the scan. Runs before any removal below so
+    # it reports what was present at scan time.
+    Write-Host -Object "`n[Info] Inspecting all Windows Update policy values for scan-blocking settings..."
+    $policyDiagnostics = Get-WindowsUpdatePolicyDiagnostics -Path $wsusRegPath
+    $blockingPolicyValues = @($policyDiagnostics | Where-Object { $_.IsBlocker })
+
+    if (-not $policyDiagnostics) {
+        Write-Host -Object "[Info] No Windows Update policy values are present (the '$wsusRegPath' key is absent or empty)."
+    } else {
+        if ($blockingPolicyValues) {
+            Write-Host -Object "[Warning] Found $($blockingPolicyValues.Count) Windows Update policy value(s) that can block or redirect the update scan:"
+            foreach ($finding in $blockingPolicyValues) {
+                Write-Host -Object "[Warning]   $($finding.Name) = $($finding.Value)  ->  $($finding.Explanation)"
+            }
+            Write-Host -Object "[Warning] These are set independently of the WSUS server address, so a clean WSUS audit won't show them. Because Group Policy can't reach a domain controller to refresh, a tattooed value like this stays frozen in the registry; use -RemoveWSUSSettings to clear the whole key, and confirm the source GPO (domain or Local) is disabled so it isn't rewritten on the next policy refresh."
+        } else {
+            Write-Host -Object "[Info] No known scan-blocking policy values were found in the Windows Update policy key."
+        }
+
+        # Show every value present for context, since a non-standard value not in the known-blocker list can still be worth eyeballing
+        Write-Host -Object "[Info] All values currently present under the Windows Update policy key:"
+        foreach ($finding in $policyDiagnostics) {
+            Write-Host -Object "[Info]   $($finding.Key.Replace('HKLM:\',''))\$($finding.Name) = $($finding.Value)"
+        }
+    }
+
+    # Inspect which update service the agent is actually bound to. This is datastore state, not policy, so a WSUS service still registered here
+    # is a direct cause of 0x80240438 that a clean policy key won't reveal - and the most likely remaining culprit once the registry/GPO side is
+    # confirmed clean. Runs before any cache reset below so it reports the binding as it stands at scan time.
+    Write-Host -Object "`n[Info] Checking which update service the Windows Update Agent is bound to..."
+    $registeredServices = Get-RegisteredUpdateServices
+    $boundNonMicrosoftServices = @($registeredServices | Where-Object { $_.IsConcern })
+
+    if (-not $registeredServices) {
+        Write-Host -Object "[Warning] Could not enumerate the registered update services."
+    } else {
+        foreach ($service in $registeredServices) {
+            $label = if ($service.KnownName) { $service.KnownName } else { "Unknown/third-party" }
+            $flags = @()
+            if ($service.IsDefaultAUService) { $flags += "DefaultAUService" }
+            if ($service.IsRegisteredWithAU) { $flags += "RegisteredWithAU" }
+            $flagText = if ($flags) { " [$($flags -join ', ')]" } else { "" }
+
+            Write-Host -Object "[Info]   $($service.Name) ($label)$flagText"
+            if ($service.ServiceUrl) { Write-Host -Object "[Info]       Service URL: $($service.ServiceUrl)" }
+        }
+
+        if ($boundNonMicrosoftServices) {
+            Write-Host -Object "[Warning] The Windows Update Agent is still bound to a WSUS/third-party update service, so WSUS is EFFECTIVELY still active on this device even if the policy registry reads 'Not Configured' - this binding, not the policy key, is what a scan actually uses:"
+            foreach ($service in $boundNonMicrosoftServices) {
+                Write-Host -Object "[Warning]   $($service.Name) - Service URL: $(if ($service.ServiceUrl) { $service.ServiceUrl } else { 'n/a (endpoint recorded in the agent datastore / WindowsUpdate.log)' })"
+            }
+            Write-Host -Object "[Warning] A managed WSUS binding does NOT clear by removing the registry settings or resetting the cache. It clears only when the device completes a Group Policy cycle against a reachable domain controller (on-site or VPN) with no WSUS configured, or when the device is removed from the domain."
+        } else {
+            Write-Host -Object "[Info] The agent is bound only to Microsoft's update service(s); no stale WSUS/third-party service registration was found."
+        }
+    }
+
     # If requested, remove the WSUS settings from the registry. This runs before the custom field is written, since the field should reflect the end result of this run, not the pre-removal snapshot already shown above
     if ($RemoveWSUSSettings) {
         Write-Host -Object "`n[Info] Removing WSUS settings from the registry..."
         Remove-WSUSRegistrySettings -Path $wsusRegPath
+    }
+
+    # If requested, unregister any stale WSUS/third-party service still bound to the agent (surfaced by the service-binding check above). This is
+    # the fix for a WSUS service that remains the DefaultAUService after the registry/GPO are clean - which -ResetWindowsUpdateCache does NOT clear,
+    # since the binding lives outside SoftwareDistribution. Runs before the cache reset so the datastore is intact for the COM removal, then the
+    # reset (if also requested) rebuilds cleanly on top of the corrected service list.
+    # The outcome is judged by the post-remediation re-audit below (whether the binding is actually gone), not by this call's return -
+    # a managed binding can't be removed locally, so its return isn't a reliable success signal. Discard it to avoid a dead variable.
+    if ($UnregisterStaleUpdateServices) {
+        if ($boundNonMicrosoftServices) {
+            Write-Host -Object "`n[Info] Unregistering stale WSUS/third-party update service(s) from the Windows Update Agent..."
+            $null = Remove-StaleUpdateServiceRegistration -Services $boundNonMicrosoftServices
+        } else {
+            Write-Host -Object "`n[Info] No stale WSUS/third-party update service was bound to the agent; nothing to unregister."
+        }
     }
 
     # If requested, reset the Windows Update cache so the agent rebuilds it from scratch instead of continuing to reference anything tied to the old WSUS server
@@ -1069,6 +1400,19 @@ process {
     if ($ResetWindowsUpdateCache) {
         Write-Host -Object "`n[Info] Resetting the Windows Update cache..."
         $cacheResetSucceeded = Reset-WindowsUpdateCache
+    }
+
+    # Re-audit the bound update services so the console + custom field reflect the post-remediation state (i.e. whether the WSUS binding is actually gone)
+    $finalBoundNonMicrosoftServices = $boundNonMicrosoftServices
+    if ($UnregisterStaleUpdateServices -and $boundNonMicrosoftServices) {
+        $finalRegisteredServices = Get-RegisteredUpdateServices
+        $finalBoundNonMicrosoftServices = @($finalRegisteredServices | Where-Object { $_.IsConcern })
+
+        if ($finalBoundNonMicrosoftServices) {
+            Write-Host -Object "[Warning] A WSUS/third-party update service is STILL bound after the unregister attempt: $(($finalBoundNonMicrosoftServices | ForEach-Object { $_.Name }) -join ', '). This is a managed registration; it cannot be removed locally while the device is domain-joined. It will clear when the device next completes a Group Policy cycle against a reachable domain controller, or when the device is removed from the domain."
+        } else {
+            Write-Host -Object "[Info] Confirmed: no WSUS/third-party update service remains bound to the agent. The agent will scan against Microsoft's update service."
+        }
     }
 
     # Re-check the live registry for the final WSUS state. If nothing was removed above, this simply confirms what was already detected; if removal ran, this reflects whether it actually took
@@ -1088,51 +1432,89 @@ process {
         if ($finalServerReg.WUStatusServer) { $finalStatisticsServer = $finalServerReg.WUStatusServer }
     }
 
+    # Determine the EFFECTIVE WSUS state for reporting. The policy registry can read "Not Configured" while the Windows Update Agent is
+    # STILL bound to a WSUS service - a managed registration lives in the agent's datastore, not the policy key. When that's the case WSUS
+    # is effectively still active (the binding, not the empty policy key, is what a scan uses), so the report must lead with the binding.
+    # This fixes the custom field previously reading "WSUS Status: Not Configured" on a device where a WSUS service was clearly still bound.
+    if ($finalBoundNonMicrosoftServices) {
+        $effectiveWSUSState = "Bound to service ($(($finalBoundNonMicrosoftServices | ForEach-Object { $_.Name }) -join ', '))"
+    } elseif ($finalWSUSStatus -ne "Not Configured") {
+        $effectiveWSUSState = "$finalWSUSStatus (policy)"
+    } else {
+        $effectiveWSUSState = "Not Configured"
+    }
+
     # If a custom field was specified, write to it
     if ($CustomFieldName) {
         # Initiate the custom field value
         $customFieldValue = [System.Text.StringBuilder]::new()
 
-        # Report the final (post-removal, if applicable) WSUS state - the console output above already shows the before/after detail
-        if ($finalWSUSStatus -ne "Not Configured") {
-            # Add the status to the custom field value
-            $customFieldValue.Append("WSUS Status: $finalWSUSStatus")
+        # Fields are appended in priority order - the most actionable/diagnostic items first, the verbose applied-GPO list last - because the
+        # final value is truncated to fit NinjaOne's 200-character text-field limit below, and truncation drops from the end. The full detail
+        # for every field is always in the console output above regardless of what the field can hold.
 
-            # Add the servers to the custom field value
+        # 1) EFFECTIVE WSUS state - reflects a bound managed service, not just the policy key (see $effectiveWSUSState above). This is the
+        # fix for the field previously reading "Not Configured" while a WSUS service was clearly still bound. The bound-service name is
+        # folded into this headline, so there's no separate (and previously contradictory) "Bound Non-MS Service" field anymore.
+        [void]$customFieldValue.Append("WSUS: $effectiveWSUSState")
+
+        # Include the policy server address(es) only when a WSUS server is actually set in policy
+        if ($finalWSUSStatus -ne "Not Configured") {
             if ($finalUpdateServer -eq $finalStatisticsServer) {
                 [void]$customFieldValue.Append(" | Update and Statistics Server: $finalUpdateServer")
             } else {
                 [void]$customFieldValue.Append(" | Update Server: $finalUpdateServer | Statistics Server: $finalStatisticsServer")
             }
-        } else {
-            [void]$customFieldValue.Append("WSUS Status: Not Configured")
         }
 
-        # If a GPO was attributed as the source, add it for context, since that attribution doesn't change based on whether the registry was just cleared
+        # 2) Scan-blocking policy values (names only) - a direct cause of a failed scan, so it ranks high
+        if ($blockingPolicyValues) {
+            [void]$customFieldValue.Append(" | Scan Blockers: $($blockingPolicyValues.Name -join ', ')")
+        }
+
+        # 3) Result of the unregister action, if it was requested. Judge it by whether the binding is actually gone now - NOT by the COM
+        # call's return - since a managed binding can't be removed locally; report that it needs a DC/domain change rather than "Failed".
+        if ($UnregisterStaleUpdateServices -and $boundNonMicrosoftServices) {
+            [void]$customFieldValue.Append(" | Unregister: $(if (-not $finalBoundNonMicrosoftServices) { 'Cleared' } else { 'Blocked-NeedsDC/Domain' })")
+        }
+
+        # 4) DC reachability context (domain-joined only) - explains whether a managed WSUS binding can be expected to clear on this run
+        if ($null -ne $DomainControllerReachable) {
+            [void]$customFieldValue.Append(" | DC: $(if ($DomainControllerReachable) { 'Reachable' } else { 'Unreachable' })")
+        }
+
+        # 5) Cache reset result, if it was requested
+        if ($null -ne $cacheResetSucceeded) {
+            [void]$customFieldValue.Append(" | Cache Reset: $(if ($cacheResetSucceeded) { 'Completed' } else { 'Failed' })")
+        }
+
+        # 6) Windows Update endpoint connectivity count (full per-endpoint breakdown is in the console output)
+        if ($connectivityResults) {
+            [void]$customFieldValue.Append(" | WU Connectivity: $reachableCount/$totalEndpointCount reachable")
+        }
+
+        # 7) GPO attributed as the source, if any
         if ($ActiveWSUSSettings."WSUS Settings Source" -eq "GPO") {
             $gpoName = $ActiveWSUSSettings."GPO Display Name"
             [void]$customFieldValue.Append(" | GPO Name: $gpoName")
         }
 
-        # Add the currently applied GPOs for attribution/troubleshooting, if they were retrieved
+        # 8) Applied GPO names (longest, least actionable - deliberately last so it's the first thing dropped by truncation)
         if ($appliedGPOs) {
             [void]$customFieldValue.Append(" | Applied GPOs: $($appliedGPOs -join ', ')")
-        }
-
-        # Add the Windows Update endpoint connectivity results, if the check was requested. Only the count is included here (the full per-endpoint
-        # breakdown is already in the console output above) since NinjaOne text custom fields commonly cap out at 200 characters
-        if ($connectivityResults) {
-            [void]$customFieldValue.Append(" | WU Connectivity: $reachableCount/$totalEndpointCount reachable")
-        }
-
-        # Add the Windows Update cache reset result, if it was requested
-        if ($null -ne $cacheResetSucceeded) {
-            [void]$customFieldValue.Append(" | Cache Reset: $(if ($cacheResetSucceeded) { 'Completed' } else { 'Failed' })")
         }
 
         # Set the custom field
         try {
             $customFieldValue = $customFieldValue.ToString()
+
+            # NinjaOne single-line text custom fields reject values of 200 characters or more, which fails the whole action. Truncate defensively
+            # (with an ellipsis so it's obvious the value was clipped) so a long applied-GPO list can never turn a successful run into a failed one.
+            $maxCustomFieldLength = 199
+            if ($customFieldValue.Length -gt $maxCustomFieldLength) {
+                $customFieldValue = $customFieldValue.Substring(0, $maxCustomFieldLength - 3).TrimEnd() + "..."
+            }
+
             Write-Host -Object "`n[Info] Setting the custom field '$CustomFieldName' with the value:`n$customFieldValue"
             Set-CustomField -Name $CustomFieldName -Value $customFieldValue -Type "Text" -ErrorAction Stop
             Write-Host -Object "[Info] Successfully set the custom field '$CustomFieldName'."
