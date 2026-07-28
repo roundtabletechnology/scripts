@@ -26,7 +26,7 @@
 .EXAMPLE
     (No Parameters)
 
-    [Info] Script Version: 1.12
+    [Info] Script Version: 1.13
     [Info] Updating group policies...
     [Info] Group policy update completed successfully.
 
@@ -48,7 +48,7 @@
 .EXAMPLE
     -CustomFieldName "WSUSSettings"
 
-    [Info] Script Version: 1.12
+    [Info] Script Version: 1.13
     [Info] Updating group policies...
     [Info] Group policy update completed successfully.
 
@@ -77,7 +77,7 @@
 .EXAMPLE
     -RemoveWSUSSettings -CustomFieldName "WSUSSettings"
 
-    [Info] Script Version: 1.12
+    [Info] Script Version: 1.13
     [Info] Checking the registry for WSUS settings...
     [Info] WSUS Update Server detected in the registry: https://test.local.another.sub.domain/test/testagain:8562
     [Info] WSUS Statistics Server detected in the registry: https://test.local.another.sub.domain/test/testagain:8562
@@ -106,7 +106,7 @@
 .EXAMPLE
     -RemoveWSUSSettings -ResetWindowsUpdateCache -TestWindowsUpdateConnectivity -CustomFieldName "WSUSSettings"
 
-    [Info] Script Version: 1.12
+    [Info] Script Version: 1.13
     [Info] Checking the registry for WSUS settings...
     [Info] WSUS Update Server detected in the registry: https://test.local.another.sub.domain/test/testagain:8562
     [Info] WSUS Statistics Server detected in the registry: https://test.local.another.sub.domain/test/testagain:8562
@@ -157,8 +157,13 @@
 
 .NOTES
     Minimum OS Architecture Supported: Windows 10, Windows Server 2016
-    Version: 1.12
+    Version: 1.13
     Release Notes:
+    - Added a read-only "other local blockers" check (Get-WindowsUpdateLocalBlockers), run on every pass, for the "it could be some other reason" cases a clean WSUS/GPO audit won't surface: an update service (wuauserv/UsoSvc/BITS) set to Disabled, updates Paused via Settings, NoAutoUpdate, a system WinHTTP proxy (a stale/dead one mimics a connectivity failure), and a deliberate outbound Windows Firewall Block rule bound to the Windows Update service. Findings that actually stop a scan are warnings and appended to the custom field as "Local Blockers: ..."; ones that only defer/suppress installs (Paused, NoAutoUpdate) are informational. Every sub-check is read-only and independently guarded, so it's safe on a field device and one missing cmdlet can't abort the rest.
+    - Remove-WSUSRegistrySettings now reports when the policy key exists but holds no values, so an empty-key deletion isn't mistaken for the fix - if the key is empty, removing it changes nothing and the real cause is a bound service, a local blocker, or connectivity.
+    - Reframed the escalation guidance to respect a no-end-user-impact constraint: the script never unjoins a device, and it now states explicitly that a domain-leave is a deliberate, planned maintenance step that must NOT be performed on a device in the field. When a managed binding can't be cleared locally, the script's job is to detect and flag it for scheduled follow-up, not to act live.
+    - Reworked how a stale WSUS binding's remediation outcome is judged, so a device that will NEVER reach a domain controller again can still be fixed AND correctly reported as fixed. What actually breaks a scan is the WSUS service being the Automatic Updates *scan source* (IsDefaultAUService / IsRegisteredWithAU), not merely being *registered*. -UnregisterStaleUpdateServices already registers Microsoft Update with AU (AddService2 flag 4), which can seize the AU default away from a managed WSUS service even when RemoveService is refused - in which case the WSUS entry lingers as a dormant, non-AU-bound registration but scans go to Microsoft (the device is fixed). The re-audit and custom field now judge success by AU-binding: "Cleared" (gone), "Cleared-DormantEntry" (Microsoft is now the scan source; a harmless WSUS registration remains), or "Blocked-NeedsDomainLeave" (WSUS is still the scan source). The effective-state headline likewise distinguishes "Bound to service" (still the scan source) from "Dormant registration (Microsoft Update is the scan source)". For a device that is permanently off-domain and still shows "Blocked", the definitive fix is to remove it from the domain (join a workgroup) and re-run - once it is no longer domain-managed the agent releases the binding.
+    - Added a read-only metered-connection check (Test-MeteredConnection via the WinRT NetworkInformation API), run on every pass. IMPORTANT: a metered connection does NOT cause the 0x80240438 "no route or network connectivity to the endpoint" scan failure this script targets - metering affects the DOWNLOAD phase (Windows defers/pauses downloads to conserve data) and shows up as deferred updates, not a connectivity error code. It is surfaced purely as patch-health context (a metered laptop can scan fine yet silently sit un-patched), reported to the console and appended to the custom field as "Metered: Yes" only when the active connection is actually metered.
     - Fixed the custom field (and console) reporting "WSUS Status: Not Configured" on a device where the Windows Update Agent was clearly still bound to a WSUS service. The policy registry can read "Not Configured" while a *managed* WSUS registration lives in the agent's datastore - and that binding, not the empty policy key, is what a scan actually uses. The report now leads with an EFFECTIVE WSUS state ("Bound to service (<name>)" when a WSUS/third-party service is still bound, otherwise the policy state), and the previously separate, contradictory "Bound Non-MS Service" field is folded into that headline.
     - Added a domain-controller reachability check (Test-DomainControllerReachable via nltest /dsgetdc) reported as context only - it NEVER gates the remediation switches, so local cleanup still runs on a decommissioned-domain client. It appears in the console and as "DC: Reachable/Unreachable" in the custom field, and explains the common real-world cause (a roaming laptop off the corporate network/VPN, or a dead domain) for why a managed WSUS binding can't clear on a given run.
     - Corrected the guidance the script prints about a bound WSUS service. A *managed* WSUS binding does NOT clear by removing the registry settings or resetting the cache (the earlier "-ResetWindowsUpdateCache will clear it" advice was wrong); it clears only when the device completes a Group Policy cycle against a reachable domain controller with no WSUS configured, or when the device is removed from the domain. The -UnregisterStaleUpdateServices result is now reported as "Cleared" or "Blocked-NeedsDC/Domain" based on whether the binding is actually gone after the attempt, rather than on the COM call's return.
@@ -187,6 +192,7 @@
     Modified to include full Windows Update policy-value inspection and registered update-service (datastore binding) inspection 7/22/2026 BBJr
     Modified to add -UnregisterStaleUpdateServices remediation, fix a false cache-reset failure on cryptsvc, and truncate the custom field to NinjaOne's 200-char limit 7/22/2026 BBJr
     Modified to report the EFFECTIVE WSUS state (bound managed service vs. policy), add DC-reachability context without gating remediation, and stop failing the action over a managed binding that can't be removed locally 7/22/2026 BBJr
+    Modified to judge stale-binding remediation by AU scan-source (not mere registration) so permanently-off-domain devices can be fixed and reported honestly, and add a read-only metered-connection check 7/28/2026 BBJr
 #>
 
 [CmdletBinding()]
@@ -200,7 +206,7 @@ param (
 begin {
     # Keep in sync with the Version value in the comment-based help .NOTES block above.
     # Printed first so NinjaOne activity logs always show which revision of the script actually ran - useful when a fix doesn't seem to have taken effect on an endpoint.
-    $ScriptVersion = "1.12"
+    $ScriptVersion = "1.13"
     Write-Host -Object "[Info] Script Version: $ScriptVersion"
 
     # Import custom field from script variable
@@ -407,6 +413,21 @@ begin {
         if (!(Test-Path -Path $Path)) {
             Write-Host -Object "[Info] No WSUS registry settings were found at '$Path' to remove."
             return
+        }
+
+        # The key can exist while carrying no values at all (an empty container). Deleting it in that case is harmless but has NO
+        # functional effect on the update source - a useful thing to say out loud so an empty-key removal isn't mistaken for the fix.
+        # Count real values under the key and its AU subkey, excluding PowerShell's PS* housekeeping properties.
+        $valueCount = 0
+        foreach ($subPath in $Path, "$Path\AU") {
+            if (!(Test-Path -Path $subPath)) { continue }
+            $props = Get-ItemProperty -Path $subPath -ErrorAction SilentlyContinue
+            if ($props) {
+                $valueCount += @($props.PSObject.Properties | Where-Object { $_.Name -notmatch "^PS(Path|ParentPath|ChildName|Provider|Drive)$" }).Count
+            }
+        }
+        if ($valueCount -eq 0) {
+            Write-Host -Object "[Info] The '$Path' key exists but holds no values. Removing it is harmless but will not change the update source - if scans are still failing, the cause is elsewhere (a bound update service, a local blocker, or connectivity), not this key."
         }
 
         try {
@@ -834,6 +855,134 @@ begin {
         } catch {
             return $false
         }
+    }
+
+    # Function to report whether the device's active internet connection is metered. This is REPORTING CONTEXT ONLY.
+    # IMPORTANT: a metered connection does NOT cause the 0x80240438 "no route or network connectivity to the endpoint"
+    # scan failure this script targets - metering affects the DOWNLOAD phase (Windows defers/pauses downloads to save
+    # data), not the scan/detection phase, and it surfaces as deferred updates rather than a connectivity error code.
+    # It's surfaced here because it's a cheap, legitimate patch-health check (a metered laptop can silently sit un-patched
+    # even with a perfectly healthy scan path), but it should not be mistaken for the cause of a failed scan.
+    # Uses the WinRT NetworkInformation API, which reflects both the per-media default and any per-network "Set as metered"
+    # override a user or policy applied - the authoritative source for "is my current connection metered right now".
+    function Test-MeteredConnection {
+        [CmdletBinding()]
+        param ()
+
+        try {
+            # Project the WinRT type into PowerShell 5.1 (supported on Windows 10 / Server 2016+, the script's minimum OS)
+            $null = [Windows.Networking.Connectivity.NetworkInformation, Windows.Networking.Connectivity, ContentType = WindowsRuntime]
+
+            $connectionProfile = [Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile()
+            if (-not $connectionProfile) { return $null } # no active internet connection profile to evaluate
+
+            $cost = $connectionProfile.GetConnectionCost()
+            if (-not $cost) { return $null }
+
+            # NetworkCostType: 0 = Unknown, 1 = Unrestricted, 2 = Fixed, 3 = Variable. Fixed and Variable are both "metered".
+            $costType = [int]$cost.NetworkCostType
+            $isMetered = ($costType -eq 2 -or $costType -eq 3)
+
+            [PSCustomObject]@{
+                IsMetered       = $isMetered
+                NetworkCostType = switch ($costType) { 1 { "Unrestricted" } 2 { "Fixed (metered)" } 3 { "Variable (metered)" } default { "Unknown" } }
+                OverDataLimit   = [bool]$cost.OverDataLimit
+                Roaming         = [bool]$cost.Roaming
+            }
+        } catch {
+            # WinRT unavailable or the API threw - treat metered status as undeterminable rather than failing the script
+            return $null
+        }
+    }
+
+    # Function to detect LOCAL, non-WSUS reasons a Windows Update scan or patch cycle can fail or stall - the "it could be some
+    # other reason" cases that a clean WSUS/GPO audit won't surface. Everything here is READ-ONLY (no changes), so it's safe to
+    # run on a field device with no end-user impact. Each sub-check is independently guarded so a missing cmdlet or API can't
+    # abort the rest. Findings are tagged IsBlocker = $true when they will actually stop a scan (0x80240438-class), or $false
+    # when they only defer/suppress installs (worth reporting, but not the connectivity error this script chases).
+    function Get-WindowsUpdateLocalBlockers {
+        [CmdletBinding()]
+        param ()
+
+        $findings = New-Object System.Collections.Generic.List[object]
+
+        # 1) Update-related services set to Disabled - a common manual "just turn it off" action. A disabled wuauserv/UsoSvc/BITS
+        # stops scans/downloads outright. (These are the same services the remediation switches restart, but only if not Disabled.)
+        foreach ($svcName in "wuauserv", "UsoSvc", "bits") {
+            try {
+                $svc = Get-CimInstance -ClassName Win32_Service -Filter "Name='$svcName'" -ErrorAction Stop
+            } catch { $svc = $null }
+
+            if ($svc -and $svc.StartMode -eq "Disabled") {
+                $findings.Add([PSCustomObject]@{
+                    Category  = "Service Disabled"
+                    Detail    = "The '$svcName' service start type is Disabled. Windows Update cannot scan or install while a required service is disabled. Re-enable it (Manual/Automatic) to restore patching."
+                    IsBlocker = $true
+                })
+            }
+        }
+
+        # 2) Updates paused via the Settings UI - the literal "I don't wanna do it" button. Defers updates; not a 0x80240438 cause,
+        # but it will make a device look un-patched. PausedQualityStatus/PausedFeatureStatus = 2 when paused; PauseUpdatesExpiryTime holds the end date.
+        try {
+            $ux = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings" -ErrorAction Stop
+        } catch { $ux = $null }
+
+        if ($ux) {
+            $isPaused = ($ux.PausedQualityStatus -eq 2) -or ($ux.PausedFeatureStatus -eq 2) -or -not [string]::IsNullOrWhiteSpace($ux.PauseUpdatesExpiryTime)
+            if ($isPaused) {
+                $until = if ($ux.PauseUpdatesExpiryTime) { " (until $($ux.PauseUpdatesExpiryTime))" } else { "" }
+                $findings.Add([PSCustomObject]@{
+                    Category  = "Updates Paused"
+                    Detail    = "Windows Update is paused via Settings$until - a user or admin clicked 'Pause updates'. This defers updates but does not itself cause the 0x80240438 scan error."
+                    IsBlocker = $false
+                })
+            }
+        }
+
+        # 3) NoAutoUpdate - automatic updates turned off by policy/registry. Scans can still run, but nothing installs automatically.
+        try {
+            $auKey = Get-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" -ErrorAction Stop
+        } catch { $auKey = $null }
+
+        if ($auKey -and $auKey.NoAutoUpdate -eq 1) {
+            $findings.Add([PSCustomObject]@{
+                Category  = "Automatic Updates Disabled"
+                Detail    = "NoAutoUpdate = 1: Automatic Updates are turned off. Scans can still be initiated, but nothing installs on its own until this is cleared."
+                IsBlocker = $false
+            })
+        }
+
+        # 4) A system WinHTTP proxy - if it points at a dead/wrong proxy (common in an old WSUS-era config), scans fail to reach ANY
+        # endpoint, which looks exactly like a connectivity error. Read-only detection only; 'netsh winhttp reset proxy' is the fix if stale.
+        try {
+            $proxyOut = & "$env:SystemRoot\System32\netsh.exe" winhttp show proxy 2>&1 | Out-String
+            if ($proxyOut -match "(?im)^\s*Proxy Server\(s\)\s*:\s*(.+?)\s*$") {
+                $findings.Add([PSCustomObject]@{
+                    Category  = "WinHTTP Proxy Set"
+                    Detail    = "A system WinHTTP proxy is configured ($($Matches[1].Trim())). If that proxy is unreachable or wrong, Windows Update scans fail to reach any endpoint (mimicking 0x80240438). Verify it's valid, or run 'netsh winhttp reset proxy' if it's a stale WSUS-era setting."
+                    IsBlocker = $false
+                })
+            }
+        } catch { }
+
+        # 5) An enabled OUTBOUND Windows Firewall Block rule bound to the Windows Update service - the deliberate "block updates"
+        # rule Brad/colleague flagged. Scoped to rules attached to the wuauserv service so this doesn't false-positive on unrelated blocks.
+        try {
+            $wuBlockRules = Get-NetFirewallServiceFilter -Service wuauserv -ErrorAction Stop |
+                Get-NetFirewallRule -ErrorAction Stop |
+                Where-Object { $_.Enabled -eq 'True' -and $_.Direction -eq 'Outbound' -and $_.Action -eq 'Block' }
+
+            foreach ($rule in $wuBlockRules) {
+                $findings.Add([PSCustomObject]@{
+                    Category  = "Firewall Block Rule"
+                    Detail    = "An enabled outbound Windows Firewall Block rule is bound to the Windows Update service: '$($rule.DisplayName)'. This can deliberately prevent the agent from reaching update endpoints."
+                    IsBlocker = $true
+                })
+            }
+        } catch { }
+
+        return $findings
     }
 
     # Function to test if a device is domain-joined
@@ -1374,6 +1523,40 @@ process {
         }
     }
 
+    # Report whether the active internet connection is metered. This is read-only patch-health context and always runs.
+    # NOTE: metering does NOT cause the 0x80240438 scan failure this script targets - it affects the DOWNLOAD phase (Windows
+    # defers/pauses downloads to conserve data) and shows up as deferred updates, not a connectivity error - so it is reported
+    # here as a distinct, cheap check that can explain why an otherwise-healthy device sits un-patched, never as the scan fault.
+    Write-Host -Object "`n[Info] Checking whether the active internet connection is metered..."
+    $meteredConnection = Test-MeteredConnection
+    if ($null -eq $meteredConnection) {
+        Write-Host -Object "[Info] Could not determine the connection cost (no active internet profile, or the connection-cost API was unavailable)."
+    } elseif ($meteredConnection.IsMetered) {
+        Write-Host -Object "[Warning] The active internet connection is METERED (cost type: $($meteredConnection.NetworkCostType)$(if ($meteredConnection.OverDataLimit) { ', over data limit' })$(if ($meteredConnection.Roaming) { ', roaming' })). Windows will defer or pause update downloads on a metered connection. This does NOT cause the 0x80240438 scan error, but it can leave a device that scans successfully sitting un-patched - clear the metered flag on the connection (Settings > Network > Properties), or allow updates over metered connections, if this device is expected to patch here."
+    } else {
+        Write-Host -Object "[Info] The active internet connection is not metered (cost type: $($meteredConnection.NetworkCostType))."
+    }
+
+    # Detect other LOCAL, non-WSUS reasons a scan/patch cycle can fail - a disabled update service, paused updates, NoAutoUpdate,
+    # a stale WinHTTP proxy, or a deliberate outbound firewall Block rule. This covers the "it could be some other reason" cases a
+    # clean WSUS/GPO audit won't show. All read-only, so it's safe on a field device. Blockers (will stop a scan) are warnings;
+    # non-blockers (only defer/suppress installs) are informational.
+    Write-Host -Object "`n[Info] Checking for other local settings that can block or defer Windows Update..."
+    $localBlockers = Get-WindowsUpdateLocalBlockers
+    $scanBlockingLocal = @($localBlockers | Where-Object { $_.IsBlocker })
+
+    if (-not $localBlockers -or $localBlockers.Count -eq 0) {
+        Write-Host -Object "[Info] No local update-blocking settings (disabled service, paused updates, proxy, firewall block) were found."
+    } else {
+        foreach ($finding in $localBlockers) {
+            $prefix = if ($finding.IsBlocker) { "[Warning]" } else { "[Info]" }
+            Write-Host -Object "$prefix   $($finding.Category): $($finding.Detail)"
+        }
+        if ($scanBlockingLocal) {
+            Write-Host -Object "[Warning] $($scanBlockingLocal.Count) of the above will actively stop a scan and should be corrected regardless of the WSUS state."
+        }
+    }
+
     # If requested, remove the WSUS settings from the registry. This runs before the custom field is written, since the field should reflect the end result of this run, not the pre-removal snapshot already shown above
     if ($RemoveWSUSSettings) {
         Write-Host -Object "`n[Info] Removing WSUS settings from the registry..."
@@ -1402,14 +1585,26 @@ process {
         $cacheResetSucceeded = Reset-WindowsUpdateCache
     }
 
-    # Re-audit the bound update services so the console + custom field reflect the post-remediation state (i.e. whether the WSUS binding is actually gone)
+    # Re-audit the bound update services so the console + custom field reflect the post-remediation state.
+    # CRITICAL DISTINCTION for boxes that will never reach a DC again: what breaks a scan is not the WSUS service merely being
+    # *registered*, it's the WSUS service still being the AU *scan source* (IsDefaultAUService / IsRegisteredWithAU). The
+    # -UnregisterStaleUpdateServices path registers Microsoft Update WITH Automatic Updates (AddService2 flag 4), which can seize
+    # the AU default away from WSUS even when RemoveService is refused on the managed registration. When that happens the WSUS
+    # service lingers as a dormant, non-AU-bound registration but scans go to Microsoft - i.e. the device is FIXED even though a
+    # WSUS entry still shows up. So we judge success by AU-binding, and report a lingering-but-dormant WSUS entry as fixed, not blocked.
     $finalBoundNonMicrosoftServices = $boundNonMicrosoftServices
+    $finalAUBoundConcerns = $boundNonMicrosoftServices
     if ($UnregisterStaleUpdateServices -and $boundNonMicrosoftServices) {
         $finalRegisteredServices = Get-RegisteredUpdateServices
         $finalBoundNonMicrosoftServices = @($finalRegisteredServices | Where-Object { $_.IsConcern })
+        # The subset that is still the actual AU scan source - the only state that keeps a scan failing 0x80240438
+        $finalAUBoundConcerns = @($finalBoundNonMicrosoftServices | Where-Object { $_.IsDefaultAUService -or $_.IsRegisteredWithAU })
 
-        if ($finalBoundNonMicrosoftServices) {
-            Write-Host -Object "[Warning] A WSUS/third-party update service is STILL bound after the unregister attempt: $(($finalBoundNonMicrosoftServices | ForEach-Object { $_.Name }) -join ', '). This is a managed registration; it cannot be removed locally while the device is domain-joined. It will clear when the device next completes a Group Policy cycle against a reachable domain controller, or when the device is removed from the domain."
+        if ($finalAUBoundConcerns) {
+            Write-Host -Object "[Warning] A WSUS/third-party service is STILL the Automatic Updates scan source after the attempt: $(($finalAUBoundConcerns | ForEach-Object { $_.Name }) -join ', '). Microsoft Update could not be made the default locally - this is a managed registration the agent won't release while it's domain-joined and can't see a DC."
+            Write-Host -Object "[Warning] This is an environmental limit, not a script failure, and no non-disruptive local action can force it. Clearing it requires either a Group Policy cycle against a reachable DC (get the device on-site/VPN once), OR removing the device from the domain - the latter is a deliberate, planned maintenance step and must NOT be done to a device in the field / in front of a user. Flag this device for that follow-up rather than acting on it live."
+        } elseif ($finalBoundNonMicrosoftServices) {
+            Write-Host -Object "[Info] A WSUS service registration still exists, but it is NO LONGER the Automatic Updates scan source - Microsoft Update is now bound to AU, so scans will go to Microsoft. The leftover registration is dormant and harmless (it fully clears on a Group Policy cycle against a DC, or when the device leaves the domain)."
         } else {
             Write-Host -Object "[Info] Confirmed: no WSUS/third-party update service remains bound to the agent. The agent will scan against Microsoft's update service."
         }
@@ -1436,8 +1631,13 @@ process {
     # STILL bound to a WSUS service - a managed registration lives in the agent's datastore, not the policy key. When that's the case WSUS
     # is effectively still active (the binding, not the empty policy key, is what a scan uses), so the report must lead with the binding.
     # This fixes the custom field previously reading "WSUS Status: Not Configured" on a device where a WSUS service was clearly still bound.
-    if ($finalBoundNonMicrosoftServices) {
-        $effectiveWSUSState = "Bound to service ($(($finalBoundNonMicrosoftServices | ForEach-Object { $_.Name }) -join ', '))"
+    # A WSUS service that is still the AU scan source is "Bound to service" (effectively active); one that remains only as a dormant,
+    # non-AU-bound registration is reported as "Dormant registration" since scans no longer use it - the distinction that tells an
+    # operator whether a DC-less device is actually fixed.
+    if ($finalAUBoundConcerns) {
+        $effectiveWSUSState = "Bound to service ($(($finalAUBoundConcerns | ForEach-Object { $_.Name }) -join ', '))"
+    } elseif ($finalBoundNonMicrosoftServices) {
+        $effectiveWSUSState = "Dormant registration (Microsoft Update is the scan source)"
     } elseif ($finalWSUSStatus -ne "Not Configured") {
         $effectiveWSUSState = "$finalWSUSStatus (policy)"
     } else {
@@ -1472,10 +1672,20 @@ process {
             [void]$customFieldValue.Append(" | Scan Blockers: $($blockingPolicyValues.Name -join ', ')")
         }
 
+        # 2b) Local (non-WSUS) scan blockers - disabled service / firewall block etc. Only the actual blockers are appended (names
+        # only) since these, like the policy blockers above, stop a scan outright regardless of the WSUS state.
+        if ($scanBlockingLocal) {
+            [void]$customFieldValue.Append(" | Local Blockers: $(($scanBlockingLocal | ForEach-Object { $_.Category }) -join ', ')")
+        }
+
         # 3) Result of the unregister action, if it was requested. Judge it by whether the binding is actually gone now - NOT by the COM
         # call's return - since a managed binding can't be removed locally; report that it needs a DC/domain change rather than "Failed".
+        # Judge by AU-binding, not mere registration: if Microsoft Update is now the AU scan source, the device is fixed even if a
+        # dormant WSUS registration lingers ("Cleared"). "Dormant" = fixed for scanning but a leftover entry remains; "Blocked" = WSUS
+        # is still the AU scan source and only a domain removal / DC policy cycle will clear it.
         if ($UnregisterStaleUpdateServices -and $boundNonMicrosoftServices) {
-            [void]$customFieldValue.Append(" | Unregister: $(if (-not $finalBoundNonMicrosoftServices) { 'Cleared' } else { 'Blocked-NeedsDC/Domain' })")
+            $unregisterVerdict = if ($finalAUBoundConcerns) { 'Blocked-NeedsDomainLeave' } elseif ($finalBoundNonMicrosoftServices) { 'Cleared-DormantEntry' } else { 'Cleared' }
+            [void]$customFieldValue.Append(" | Unregister: $unregisterVerdict")
         }
 
         # 4) DC reachability context (domain-joined only) - explains whether a managed WSUS binding can be expected to clear on this run
@@ -1483,23 +1693,30 @@ process {
             [void]$customFieldValue.Append(" | DC: $(if ($DomainControllerReachable) { 'Reachable' } else { 'Unreachable' })")
         }
 
-        # 5) Cache reset result, if it was requested
+        # 5) Metered-connection flag - only appended when the connection is actually metered (the common non-metered case
+        # adds no value and would only eat into the 199-char budget). Reported because it can leave a device un-patched, but
+        # it is NOT the 0x80240438 scan fault - it affects downloads, not scans.
+        if ($meteredConnection -and $meteredConnection.IsMetered) {
+            [void]$customFieldValue.Append(" | Metered: Yes")
+        }
+
+        # 6) Cache reset result, if it was requested
         if ($null -ne $cacheResetSucceeded) {
             [void]$customFieldValue.Append(" | Cache Reset: $(if ($cacheResetSucceeded) { 'Completed' } else { 'Failed' })")
         }
 
-        # 6) Windows Update endpoint connectivity count (full per-endpoint breakdown is in the console output)
+        # 7) Windows Update endpoint connectivity count (full per-endpoint breakdown is in the console output)
         if ($connectivityResults) {
             [void]$customFieldValue.Append(" | WU Connectivity: $reachableCount/$totalEndpointCount reachable")
         }
 
-        # 7) GPO attributed as the source, if any
+        # 8) GPO attributed as the source, if any
         if ($ActiveWSUSSettings."WSUS Settings Source" -eq "GPO") {
             $gpoName = $ActiveWSUSSettings."GPO Display Name"
             [void]$customFieldValue.Append(" | GPO Name: $gpoName")
         }
 
-        # 8) Applied GPO names (longest, least actionable - deliberately last so it's the first thing dropped by truncation)
+        # 9) Applied GPO names (longest, least actionable - deliberately last so it's the first thing dropped by truncation)
         if ($appliedGPOs) {
             [void]$customFieldValue.Append(" | Applied GPOs: $($appliedGPOs -join ', ')")
         }
