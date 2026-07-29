@@ -236,7 +236,7 @@ param (
 begin {
     # Keep in sync with the Version value in the comment-based help .NOTES block above.
     # Printed first so NinjaOne activity logs always show which revision of the script actually ran - useful when a fix doesn't seem to have taken effect on an endpoint.
-    $ScriptVersion = "2.0"
+    $ScriptVersion = "2.1"
     Write-Host -Object "[Info] Script Version: $ScriptVersion"
 
     # Import the "Remove WSUS Settings" checkbox from script variable
