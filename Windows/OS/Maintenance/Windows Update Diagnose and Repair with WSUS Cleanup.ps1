@@ -2,31 +2,48 @@
 
 <#
 .SYNOPSIS
-    Audits Windows Server Update Services (WSUS) settings, removes them, and repairs the Windows Update Agent. Determines if WSUS settings are configured in the registry and identifies if they are managed via Group Policy (GPO). You can also write the results to a text custom field, optionally remove the WSUS settings from the registry, reset the Windows Update cache, and test connectivity to Microsoft's Windows Update endpoints.
+    Diagnoses and repairs Windows Update, with dedicated cleanup for decommissioned/stale WSUS servers. Always-run read-only diagnostics report the effective WSUS state (including a managed service binding the policy key can't show), scan-blocking policy values, other local blockers (disabled service, paused updates, proxy, firewall), the last successful scan date, recent Windows Update error codes from the event log, time-sync health, connection metering, and Windows' own WaaSMedic detector. Opt-in switches then repair: remove WSUS settings, reset the update cache, unregister/force-remove a stale WSUS service binding, test Microsoft endpoint connectivity, resync system time, repair or clean up the component store (DISM/SFC), and trigger WaaSMedic remediation. Results can be written to a text custom field.
 .DESCRIPTION
-    Audits Windows Server Update Services (WSUS) settings, removes them, and repairs the Windows Update Agent. Determines if WSUS settings are configured in the registry and identifies if they are managed via Group Policy (GPO). You can also write the results to a text custom field, optionally remove the WSUS settings from the registry, reset the Windows Update cache, and test connectivity to Microsoft's Windows Update endpoints.
+    Diagnoses and repairs Windows Update, with dedicated cleanup for decommissioned/stale WSUS servers.
 
-    This script exists to clean up after decommissioned/stale WSUS servers. Clearing the registry settings alone is often not enough - the Windows Update Agent, BITS, and Group Policy can all keep referencing (or silently re-tattoo) the old server, which shows up as scan failures such as "There is no route or network connectivity to the endpoint" (0x80240438). The -ResetWindowsUpdateCache and -TestWindowsUpdateConnectivity switches address the two most common causes of that symptom once the registry is confirmed clean: a stale local Windows Update cache, and outbound firewall/proxy rules that only ever allowed traffic to the internal WSUS server.
+    The read-only diagnostics always run (no switch needed) so a single pass characterizes the device: effective WSUS state (policy AND the agent's actual bound service), full Windows Update policy-value inspection, other local blockers, the last successful scan date, the actual 0x8024xxxx error codes Windows logged, time-sync configuration, metered-connection status, and WaaSMedic detection. The repair actions are all opt-in switches, so nothing changes a device unless explicitly requested.
 
-.PARAMETER CustomFieldName
-    The name of the custom field to set with WSUS settings information.
+    WSUS cleanup exists because clearing the registry settings alone is often not enough - the Windows Update Agent, BITS, and Group Policy can all keep referencing (or silently re-tattoo) the old server, which shows up as scan failures such as "There is no route or network connectivity to the endpoint" (0x80240438). The switches address each layer: -RemoveWSUSSettings (policy registry), -UnregisterStaleUpdateServices / -ForceRemoveManagedBinding (the agent's bound service), and -ResetWindowsUpdateCache (stale local cache, which does NOT by itself clear the bound service). Connectivity to Microsoft's endpoints is now tested automatically on every pass, no switch needed. The general repairs -ResyncSystemTime, -RepairComponentStore, -CleanupComponentStore, and -RunWaaSMedic address common non-WSUS causes of update failure. NOTE: a *managed* WSUS binding on a domain-joined device that cannot reach a domain controller cannot be cleared by any local action; it clears only via a Group Policy cycle against a reachable DC, or by removing the device from the domain.
 
 .PARAMETER RemoveWSUSSettings
     If specified, removes the WSUS policy registry key (the same key GPOs write WSUS settings to) after it has been detected and reported on. If no WSUS registry settings are found, no action is taken and this is reported.
 
+.PARAMETER UnregisterStaleUpdateServices
+    If specified, unregisters any stale WSUS/third-party update service that is still bound to the Windows Update Agent (as surfaced by the service-binding inspection) via the Microsoft.Update.ServiceManager COM API. This is the fix for a WSUS service that remains the DefaultAUService even after every WSUS registry value and GPO has been removed - a state that -ResetWindowsUpdateCache does NOT clear, because the service registration lives outside the SoftwareDistribution cache folder. Removing it makes the agent fall back to the built-in Windows Update / Microsoft Update service so scans stop failing 0x80240438 against a server that no longer exists.
+
+.PARAMETER ForceRemoveManagedBinding
+    LAST RESORT. If specified, and a managed WSUS/third-party binding is still present after -UnregisterStaleUpdateServices is refused by the COM API (0x8024801A) on a device that cannot reach a domain controller, this deletes the binding's registration directly from the registry. It is intentionally conservative and reversible: it only deletes a registry KEY whose leaf name IS the service GUID (the per-service registration), never a value that merely references the GUID; it exports each target key to a timestamped .reg backup (under %TEMP%\WSUSBindingBackup_<timestamp>) BEFORE deleting; and if no such key exists (the registration lives only in the agent datastore) it deletes nothing and reports that a DC policy cycle or domain change is the only remaining option. Keys owned by SYSTEM/TrustedInstaller that refuse a plain admin delete are reported (with the backup path) rather than force-taken. It restarts wuauserv/UsoSvc afterward and re-audits. It performs NO reboot and no user-visible action. Test on a single device first.
+
 .PARAMETER ResetWindowsUpdateCache
     If specified, stops the BITS, Windows Update, Cryptographic Services, and Update Orchestrator services, renames the SoftwareDistribution and catroot2 cache folders (Microsoft's documented Windows Update component reset), and restarts those services. This forces the Windows Update Agent to rebuild its cache and drop any stale/cached reference to a decommissioned WSUS server instead of continuing to use it until the next reboot. The next patch scan afterward will take longer than usual while the cache rebuilds.
 
-.PARAMETER TestWindowsUpdateConnectivity
-    If specified, tests DNS resolution and TCP connectivity to a representative set of Microsoft's published Windows Update, Delivery Optimization, and Automatic Root Certificate Update endpoints. Useful when an environment previously relied on WSUS exclusively and outbound firewall/proxy rules were never opened for direct internet access to Microsoft's update servers.
+.PARAMETER ResyncSystemTime
+    If specified, starts the W32Time service and runs 'w32tm /resync /force' to correct clock skew. A drifting clock breaks TLS to Microsoft's update endpoints and can mimic a connectivity failure. Does not reconfigure the time source (which would fight Group Policy on a healthy domain box); on a dead-domain/off-network device the resync simply fails to reach its source and that is reported.
 
-.PARAMETER UnregisterStaleUpdateServices
-    If specified, unregisters any stale WSUS/third-party update service that is still bound to the Windows Update Agent (as surfaced by the service-binding inspection) via the Microsoft.Update.ServiceManager COM API. This is the fix for a WSUS service that remains the DefaultAUService even after every WSUS registry value and GPO has been removed - a state that -ResetWindowsUpdateCache does NOT clear, because the service registration lives outside the SoftwareDistribution cache folder. Removing it makes the agent fall back to the built-in Windows Update / Microsoft Update service so scans stop failing 0x80240438 against a server that no longer exists.
+.PARAMETER RepairComponentStore
+    If specified, repairs the Windows component store by running 'DISM /Online /Cleanup-Image /RestoreHealth' followed by 'sfc /scannow'. This addresses update failures caused by servicing-stack/component-store corruption (distinct from the WSUS-source problem). Both steps are long-running (several minutes each) and RestoreHealth reaches out to Windows Update for replacement files, so it can be slow or fail on a device whose update source is broken. Size the RMM script timeout accordingly.
+
+.PARAMETER CleanupComponentStore
+    If specified, runs 'DISM /Online /Cleanup-Image /StartComponentCleanup' to shrink the WinSxS component store by removing superseded components.
+
+.PARAMETER ResetBase
+    Only meaningful together with -CleanupComponentStore. Adds /ResetBase to the DISM component cleanup, which removes ALL superseded versions of every component. This is DESTRUCTIVE: after it runs, existing updates and service packs can no longer be uninstalled. Off by default and ignored if -CleanupComponentStore is not also specified.
+
+.PARAMETER RunWaaSMedic
+    If specified, triggers Windows' own update self-healing engine by starting the '\Microsoft\Windows\WaaSMedic\PerformRemediation' scheduled task. Non-disruptive, but opaque about exactly what it changes. (The read-only WaaSMedic detector runs on every pass regardless of this switch.)
+
+.PARAMETER CustomFieldName
+    The name of the custom field to set with a compact summary of the diagnostics and any repair results.
 
 .EXAMPLE
     (No Parameters)
 
-    [Info] Script Version: 1.13
+    [Info] Script Version: 2.1
     [Info] Updating group policies...
     [Info] Group policy update completed successfully.
 
@@ -48,7 +65,7 @@
 .EXAMPLE
     -CustomFieldName "WSUSSettings"
 
-    [Info] Script Version: 1.13
+    [Info] Script Version: 2.1
     [Info] Updating group policies...
     [Info] Group policy update completed successfully.
 
@@ -77,7 +94,7 @@
 .EXAMPLE
     -RemoveWSUSSettings -CustomFieldName "WSUSSettings"
 
-    [Info] Script Version: 1.13
+    [Info] Script Version: 2.1
     [Info] Checking the registry for WSUS settings...
     [Info] WSUS Update Server detected in the registry: https://test.local.another.sub.domain/test/testagain:8562
     [Info] WSUS Statistics Server detected in the registry: https://test.local.another.sub.domain/test/testagain:8562
@@ -104,9 +121,9 @@
     NOTE: the console output above shows the before/after (what was found, then that it was removed), while the custom field reflects only the end result of this run - "Not Configured" once the removal succeeded.
 
 .EXAMPLE
-    -RemoveWSUSSettings -ResetWindowsUpdateCache -TestWindowsUpdateConnectivity -CustomFieldName "WSUSSettings"
+    -RemoveWSUSSettings -ResetWindowsUpdateCache -CustomFieldName "WSUSSettings"
 
-    [Info] Script Version: 1.13
+    [Info] Script Version: 2.1
     [Info] Checking the registry for WSUS settings...
     [Info] WSUS Update Server detected in the registry: https://test.local.another.sub.domain/test/testagain:8562
     [Info] WSUS Statistics Server detected in the registry: https://test.local.another.sub.domain/test/testagain:8562
@@ -157,8 +174,12 @@
 
 .NOTES
     Minimum OS Architecture Supported: Windows 10, Windows Server 2016
-    Version: 1.13
+    Version: 2.1
     Release Notes:
+    - v2.1 - Made -TestWindowsUpdateConnectivity an always-run diagnostic (dropped the switch/Ninja checkbox entirely), matching every other read-only check in this script - it's pure DNS/TCP probing with no side effects, so gating it behind a switch was the one inconsistency left. Reordered the remaining parameters/checkboxes into a logical run order: WSUS actions first (Remove -> Unregister -> Force Remove -> Cache Reset), then general repairs (Resync Time -> Repair Component Store -> Cleanup Component Store -> Reset Base -> WaaSMedic), with the output-only -CustomFieldName moved last since it configures reporting, not a repair action. The "WU Connectivity" custom-field entry now only appears when an endpoint is actually unreachable (previously always shown when the switch ran), to conserve the 199-char field budget on the common all-reachable case; full per-endpoint detail is unchanged in the console. Existing Ninja automations should remove the now-unused "testWindowsUpdateConnectivity" checkbox variable (harmless if left in place - it's simply no longer read) and update the checkbox order to match.
+    - v2.0 - Rebranded from a WSUS-only tool into a general "Windows Update Diagnose and Repair with WSUS cleanup". All prior WSUS logic is retained unchanged. Added always-run read-only diagnostics: last successful scan date (Microsoft.Update.AutoUpdate), recent Windows Update error codes pulled from the event log (Microsoft-Windows-WindowsUpdateClient IDs 20/25 - surfaces the actual 0x8024xxxx, e.g. 0x80240438, as hard evidence), time-sync configuration (flags NoSync, and NT5DS when no DC is reachable, since a drifting clock breaks TLS to Microsoft and mimics a connectivity failure), and WaaSMedic detection (Windows' own update self-healing detector, build > 17600). Added opt-in repair switches: -ResyncSystemTime (w32tm /resync), -RepairComponentStore (DISM /RestoreHealth + sfc /scannow), -CleanupComponentStore (DISM /StartComponentCleanup, with a separate default-off -ResetBase for the destructive /ResetBase), and -RunWaaSMedic (triggers the WaaSMedic PerformRemediation task). New results append to the custom field (WU Errors, Last Scan, TimeSync, WaaSMedic, and each repair's outcome). NOTE: none of these change the conclusion for a managed WSUS binding on a DC-unreachable device - that still requires a DC policy cycle or domain change; the new checks widen coverage of the OTHER, more common update-failure causes.
+    - Added -ForceRemoveManagedBinding (Ninja checkbox: forceRemoveManagedBinding), a LAST-RESORT local fix for a managed WSUS binding that the COM API refuses to remove (0x8024801A) on a device that will never reach a DC. It deletes the binding's registration directly from the registry, but is deliberately conservative and reversible: it only deletes a KEY whose leaf name IS the service GUID (never a value that merely references it), exports each target key to a timestamped .reg backup under %TEMP%\WSUSBindingBackup_<timestamp> BEFORE deleting, and does NOTHING (reporting that a DC cycle/domain change is required) if no such key exists because the registration lives only in the protected datastore. Keys owned by SYSTEM/TrustedInstaller that refuse a plain admin delete are reported with their backup path rather than force-taken. It restarts wuauserv/UsoSvc, re-audits, and performs no reboot or user-visible action. Result is appended to the custom field as "ForceRemove: Deleted N | NoRegKey | AccessDenied". Runs after -UnregisterStaleUpdateServices (clean path first) and before -ResetWindowsUpdateCache (so the datastore rebuilds clean).
+    - Added a read-only registry-footprint locator (Get-UpdateServiceRegistryFootprint) that runs whenever a WSUS/third-party service is still bound, to find WHERE that managed registration physically lives. A managed WSUS service can't be removed via COM (RemoveService returns 0x8024801A) and survives a SoftwareDistribution rename, so if it's registry-backed, that key is the only remaining target for a non-disruptive, DC-free removal (delete the registration + restart wuauserv). The locator searches only the Windows Update registry subtrees (fast enough for an RMM run) and reports every key/value where the service GUID appears - or reports that none exists, which proves the binding lives only in the protected datastore and genuinely requires a DC policy cycle or domain change. This is intel-gathering only; it writes nothing. NOTE on Local GPO: it cannot override the stuck binding - Domain GPOs outrank Local GPOs in precedence (L-S-D-OU, last wins), and the binding is an orphaned service registration no longer driven by any policy value, so rewriting policy from any direction doesn't touch it.
     - Added a read-only "other local blockers" check (Get-WindowsUpdateLocalBlockers), run on every pass, for the "it could be some other reason" cases a clean WSUS/GPO audit won't surface: an update service (wuauserv/UsoSvc/BITS) set to Disabled, updates Paused via Settings, NoAutoUpdate, a system WinHTTP proxy (a stale/dead one mimics a connectivity failure), and a deliberate outbound Windows Firewall Block rule bound to the Windows Update service. Findings that actually stop a scan are warnings and appended to the custom field as "Local Blockers: ..."; ones that only defer/suppress installs (Paused, NoAutoUpdate) are informational. Every sub-check is read-only and independently guarded, so it's safe on a field device and one missing cmdlet can't abort the rest.
     - Remove-WSUSRegistrySettings now reports when the policy key exists but holds no values, so an empty-key deletion isn't mistaken for the fix - if the key is empty, removing it changes nothing and the real cause is a bound service, a local blocker, or connectivity.
     - Reframed the escalation guidance to respect a no-end-user-impact constraint: the script never unjoins a device, and it now states explicitly that a domain-leave is a deliberate, planned maintenance step that must NOT be performed on a device in the field. When a managed binding can't be cleared locally, the script's job is to detect and flag it for scheduled follow-up, not to act live.
@@ -193,36 +214,63 @@
     Modified to add -UnregisterStaleUpdateServices remediation, fix a false cache-reset failure on cryptsvc, and truncate the custom field to NinjaOne's 200-char limit 7/22/2026 BBJr
     Modified to report the EFFECTIVE WSUS state (bound managed service vs. policy), add DC-reachability context without gating remediation, and stop failing the action over a managed binding that can't be removed locally 7/22/2026 BBJr
     Modified to judge stale-binding remediation by AU scan-source (not mere registration) so permanently-off-domain devices can be fixed and reported honestly, and add a read-only metered-connection check 7/28/2026 BBJr
+    Modified to add a read-only registry-footprint locator for a stuck managed WSUS binding, to find a local DC-free removal target (or prove one doesn't exist) 7/29/2026 BBJr
+    Modified to add -ForceRemoveManagedBinding, a last-resort reversible registry deletion (with .reg backup) of a stuck managed WSUS binding when the COM API refuses it and no DC is reachable 7/29/2026 BBJr
+    Rebranded to a general "Windows Update Diagnose and Repair with WSUS cleanup" (v2.0): added always-run health diagnostics (last-scan date, event-log error codes, time sync, WaaSMedic) and opt-in repairs (time resync, DISM RestoreHealth+SFC, DISM component cleanup, WaaSMedic remediation) 7/29/2026 BBJr
+    Made connectivity testing an always-run diagnostic and reordered parameters into a logical run order (v2.1) 7/29/2026 BBJr
 #>
 
 [CmdletBinding()]
 param (
-    [string]$CustomFieldName,
     [switch]$RemoveWSUSSettings,
+    [switch]$UnregisterStaleUpdateServices,
+    [switch]$ForceRemoveManagedBinding,
     [switch]$ResetWindowsUpdateCache,
-    [switch]$TestWindowsUpdateConnectivity,
-    [switch]$UnregisterStaleUpdateServices
+    [switch]$ResyncSystemTime,
+    [switch]$RepairComponentStore,
+    [switch]$CleanupComponentStore,
+    [switch]$ResetBase,
+    [switch]$RunWaaSMedic,
+    [string]$CustomFieldName
 )
 begin {
     # Keep in sync with the Version value in the comment-based help .NOTES block above.
     # Printed first so NinjaOne activity logs always show which revision of the script actually ran - useful when a fix doesn't seem to have taken effect on an endpoint.
-    $ScriptVersion = "1.13"
+    $ScriptVersion = "2.0"
     Write-Host -Object "[Info] Script Version: $ScriptVersion"
-
-    # Import custom field from script variable
-    if ($env:textCustomFieldName) { $CustomFieldName = $env:textCustomFieldName }
 
     # Import the "Remove WSUS Settings" checkbox from script variable
     if ($env:removeWsusSettings -eq "true") { $RemoveWSUSSettings = $true }
 
+    # Import the "Unregister Stale Update Services" checkbox from script variable
+    if ($env:unregisterStaleUpdateServices -eq "true") { $UnregisterStaleUpdateServices = $true }
+
+    # Import the "Force Remove Managed Binding" checkbox from script variable
+    if ($env:forceRemoveManagedBinding -eq "true") { $ForceRemoveManagedBinding = $true }
+
     # Import the "Reset Windows Update Cache" checkbox from script variable
     if ($env:resetWindowsUpdateCache -eq "true") { $ResetWindowsUpdateCache = $true }
 
-    # Import the "Test Windows Update Connectivity" checkbox from script variable
-    if ($env:testWindowsUpdateConnectivity -eq "true") { $TestWindowsUpdateConnectivity = $true }
+    # Import the "Resync System Time" checkbox from script variable
+    if ($env:resyncSystemTime -eq "true") { $ResyncSystemTime = $true }
 
-    # Import the "Unregister Stale Update Services" checkbox from script variable
-    if ($env:unregisterStaleUpdateServices -eq "true") { $UnregisterStaleUpdateServices = $true }
+    # Import the "Repair Component Store" checkbox from script variable
+    if ($env:repairComponentStore -eq "true") { $RepairComponentStore = $true }
+
+    # Import the "Cleanup Component Store" checkbox from script variable
+    if ($env:cleanupComponentStore -eq "true") { $CleanupComponentStore = $true }
+
+    # Import the "Reset Base" checkbox from script variable (destructive sub-option of Cleanup Component Store)
+    if ($env:resetBase -eq "true") { $ResetBase = $true }
+
+    # Import the "Run WaaSMedic" checkbox from script variable
+    # NOTE: NinjaOne auto-generates this variable name from the "Run WaaS Medic" label as 'runWaasMedic' (lowercase 's'),
+    # not 'runWaaSMedic' - match that exact casing here. Windows env vars are case-insensitive so this would likely still
+    # work either way, but there's no reason to rely on that when the exact name is known.
+    if ($env:runWaasMedic -eq "true") { $RunWaaSMedic = $true }
+
+    # Import custom field from script variable
+    if ($env:textCustomFieldName) { $CustomFieldName = $env:textCustomFieldName }
 
     # Validate the custom field name if provided
     if ($CustomFieldName) {
@@ -755,6 +803,139 @@ begin {
         return $services
     }
 
+    # Function to locate WHERE a given update-service registration (by ServiceID GUID) physically lives in the registry. READ-ONLY intel only.
+    # Context: a *managed* WSUS service can't be removed via the COM API (RemoveService returns 0x8024801A) and does NOT clear by renaming
+    # SoftwareDistribution - so if it survives both, its registration must persist in the registry, and the only remaining non-disruptive,
+    # DC-free way to clear it is to delete that specific registration key and restart wuauserv. This function finds the exact target (or proves
+    # there is none in the registry, meaning the binding lives only in the protected datastore and a DC/domain change is genuinely required).
+    # It searches ONLY the Windows Update registry subtrees (not all of HKLM) so it stays fast enough for an RMM run, and reports every key or
+    # value where the GUID appears. It NEVER writes anything.
+    function Get-UpdateServiceRegistryFootprint {
+        [CmdletBinding()]
+        param (
+            [Parameter(Mandatory = $True)]
+            [string]$ServiceId
+        )
+
+        # Scoped to the update-agent's own registry trees - where a service registration would live if it's registry-backed at all.
+        $roots = @(
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate"
+            "HKLM:\SOFTWARE\Microsoft\WindowsUpdate"
+            "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate"
+        )
+
+        $hits = New-Object System.Collections.Generic.List[object]
+
+        foreach ($root in $roots) {
+            if (!(Test-Path -Path $root)) { continue }
+
+            # The root itself plus every subkey under it
+            $keyPaths = New-Object System.Collections.Generic.List[string]
+            $keyPaths.Add($root)
+            Get-ChildItem -Path $root -Recurse -ErrorAction SilentlyContinue | ForEach-Object { $keyPaths.Add($_.PSPath) }
+
+            foreach ($keyPath in $keyPaths) {
+                # Normalize the display path (strip the PowerShell provider prefix)
+                $displayPath = $keyPath -replace '^Microsoft\.PowerShell\.Core\\Registry::', '' -replace '^HKEY_LOCAL_MACHINE', 'HKLM:'
+
+                # 1) GUID as the (sub)key name itself - the classic per-service registration key
+                if (($displayPath -split '\\')[-1] -like "*$ServiceId*") {
+                    $hits.Add([PSCustomObject]@{ Path = $displayPath; Where = "key name"; Data = "" })
+                }
+
+                # 2) GUID appearing in any value name or value data under this key
+                $props = Get-ItemProperty -Path $keyPath -ErrorAction SilentlyContinue
+                if ($props) {
+                    foreach ($p in $props.PSObject.Properties) {
+                        if ($p.Name -match "^PS(Path|ParentPath|ChildName|Provider|Drive)$") { continue }
+                        if ("$($p.Name)" -like "*$ServiceId*" -or "$($p.Value)" -like "*$ServiceId*") {
+                            $hits.Add([PSCustomObject]@{ Path = $displayPath; Where = "value '$($p.Name)'"; Data = "$($p.Value)" })
+                        }
+                    }
+                }
+            }
+        }
+
+        return $hits
+    }
+
+    # Function to force-remove a stuck managed update-service registration by deleting its registry key directly, when the COM API refuses
+    # (RemoveService = 0x8024801A on a managed binding) and no DC is reachable to clear it via Group Policy. This is the LAST-RESORT, local,
+    # DC-free path for a permanently-orphaned device. It is deliberately conservative and reversible:
+    #   * It only ever deletes a registry KEY whose leaf name IS the service GUID - i.e. the per-service registration key itself. It will NOT
+    #     delete a value that merely references the GUID, since those can be unrelated tracking/state entries whose removal could do harm.
+    #   * It exports each target key to a timestamped .reg backup BEFORE deleting, so the exact registration can be restored if this doesn't help.
+    #   * If no GUID-named key exists (the registration lives only in the protected datastore), it deletes nothing and says so - proving a DC
+    #     policy cycle or domain change is the only remaining option.
+    #   * These keys are frequently owned by SYSTEM/TrustedInstaller; a plain admin delete may be refused. That's reported (with the backup path)
+    #     rather than forced, since taking ownership would be a far more invasive change than this switch should make silently.
+    # It restarts wuauserv/UsoSvc afterward so the agent re-reads its service list; the post-remediation re-audit reports whether it worked.
+    function Remove-ManagedBindingFromRegistry {
+        [CmdletBinding()]
+        param (
+            [Parameter(Mandatory = $True)]
+            [object[]]$Services
+        )
+
+        $result = [PSCustomObject]@{ Deleted = 0; AccessDenied = 0; NoTarget = 0; BackupFolder = $null }
+        $backupFolder = Join-Path -Path $env:TEMP -ChildPath "WSUSBindingBackup_$(Get-Date -Format 'yyyyMMddHHmmss')"
+
+        foreach ($svc in $Services) {
+            $footprint = Get-UpdateServiceRegistryFootprint -ServiceId $svc.ServiceID
+            # Only per-service *registration keys* (the GUID is the key's leaf name) are safe removal targets - never arbitrary value references.
+            $keyTargets = @($footprint | Where-Object { $_.Where -eq "key name" })
+
+            if (-not $keyTargets -or $keyTargets.Count -eq 0) {
+                Write-Host -Object "[Warning] No removable registry registration key was found for '$($svc.Name)' (ServiceID $($svc.ServiceID)). Only a key named with the service GUID is a safe target, and none exists - so the binding lives only in the agent datastore and cannot be cleared by a local registry deletion. A DC policy cycle or domain change is required."
+                $result.NoTarget++
+                continue
+            }
+
+            foreach ($target in $keyTargets) {
+                $psPath = $target.Path
+
+                # Back up the key first (reg.exe uses the 'HKLM\' form, not the PowerShell 'HKLM:\' provider form)
+                if (!(Test-Path -Path $backupFolder)) {
+                    try { $null = New-Item -Path $backupFolder -ItemType Directory -Force -ErrorAction Stop } catch { }
+                }
+                $regExportPath = $psPath -replace '^HKLM:\\', 'HKLM\'
+                $backupFile = Join-Path -Path $backupFolder -ChildPath "$($svc.ServiceID).reg"
+
+                $null = & "$env:SystemRoot\System32\reg.exe" export "$regExportPath" "$backupFile" /y 2>&1
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Host -Object "[Warning] Could not back up '$psPath' (reg export exit code $LASTEXITCODE). Skipping deletion of this key to stay safe - no backup, no delete."
+                    continue
+                }
+                Write-Host -Object "[Info] Backed up '$psPath' to '$backupFile' before removal."
+
+                try {
+                    Remove-Item -Path $psPath -Recurse -Force -ErrorAction Stop
+                    Write-Host -Object "[Info] Deleted registry registration key '$psPath'."
+                    $result.Deleted++
+                } catch {
+                    Write-Host -Object "[Warning] Could not delete '$psPath': $($_.Exception.Message)"
+                    Write-Host -Object "[Warning] This key is likely owned by SYSTEM/TrustedInstaller, which refuses a plain admin delete. Taking ownership is intentionally NOT done automatically. The .reg backup is at '$backupFile'."
+                    $result.AccessDenied++
+                }
+            }
+        }
+
+        if ($result.Deleted -gt 0) { $result.BackupFolder = $backupFolder }
+
+        # Restart the agent so it re-reads its (hopefully now WSUS-free) service list
+        foreach ($serviceName in "wuauserv", "UsoSvc") {
+            $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+            if (-not $service) { continue }
+            try {
+                Restart-Service -Name $serviceName -Force -ErrorAction Stop
+            } catch {
+                Write-Host -Object "[Warning] Could not restart the '$serviceName' service after the registry removal; a reboot will finish applying the change."
+            }
+        }
+
+        return $result
+    }
+
     # Function to unregister a stale WSUS / third-party update service from the Windows Update Agent via the Microsoft.Update.ServiceManager COM API.
     # This is the targeted remediation for the case Get-RegisteredUpdateServices surfaces: the WSUS service is still registered - and still the
     # DefaultAUService - even though every WSUS registry value and GPO is gone. Renaming SoftwareDistribution (-ResetWindowsUpdateCache) does NOT
@@ -983,6 +1164,204 @@ begin {
         } catch { }
 
         return $findings
+    }
+
+    # Function to report the date of the last SUCCESSFUL Windows Update scan (via the Microsoft.Update.AutoUpdate COM object). READ-ONLY.
+    # A long-ago or missing date is the single clearest "this device isn't patching" signal - on the WSUS-orphaned boxes it reads as never/stale.
+    function Get-LastUpdateScanInfo {
+        [CmdletBinding()]
+        param ()
+
+        try {
+            $auResults = (New-Object -ComObject "Microsoft.Update.AutoUpdate").Results
+            $lastSearch = $auResults.LastSearchSuccessDate  # returned in UTC; can be empty if a successful scan has never happened
+            if (-not $lastSearch -or "$lastSearch" -eq "") { return $null }
+            return [datetime]$lastSearch
+        } catch {
+            return $null
+        }
+    }
+
+    # Function to pull recent Windows Update error codes from the event log (Microsoft-Windows-WindowsUpdateClient, IDs 20/25). READ-ONLY.
+    # This surfaces the actual 0x8024xxxx codes Windows itself recorded - e.g. it will show the 0x80240438 the WSUS-orphaned boxes are hitting -
+    # as hard evidence rather than inference. Returns a de-duplicated list of codes, newest first.
+    function Get-WindowsUpdateEventErrors {
+        [CmdletBinding()]
+        param (
+            [int]$Days = 7
+        )
+
+        $codes = New-Object System.Collections.Generic.List[string]
+
+        try {
+            $startTime = (Get-Date).AddDays(-1 * [math]::Abs($Days))
+            $events = Get-WinEvent -FilterHashtable @{ LogName = "System"; ProviderName = "Microsoft-Windows-WindowsUpdateClient"; StartTime = $startTime } -ErrorAction Stop |
+                Where-Object { $_.LevelDisplayName -ne "Information" -and ($_.Id -eq 20 -or $_.Id -eq 25) }
+        } catch {
+            # No matching events (Get-WinEvent throws when the filter matches nothing) or the log is unavailable - treat as "no errors found"
+            return $codes
+        }
+
+        foreach ($event in $events) {
+            foreach ($match in [regex]::Matches("$($event.Message)", "0x[0-9A-Fa-f]{8}")) {
+                if (-not $codes.Contains($match.Value)) { $codes.Add($match.Value) }
+            }
+        }
+
+        return $codes
+    }
+
+    # Function to report the W32Time synchronization type. READ-ONLY.
+    # "NoSync" = time sync is off entirely; "NT5DS" = domain-hierarchy sync (which SILENTLY can't sync on a dead-domain/off-network box, letting
+    # the clock drift). A skewed clock breaks TLS to Microsoft's update endpoints and looks exactly like a connectivity failure - a real,
+    # otherwise-invisible cause of scan failures on long-idle roaming laptops.
+    function Get-TimeSyncStatus {
+        [CmdletBinding()]
+        param ()
+
+        try {
+            return (Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\Parameters" -Name "Type" -ErrorAction Stop).Type
+        } catch {
+            return $null
+        }
+    }
+
+    # Function to run Windows' own update self-healing detector (WaaSMedic) in DETECTION-ONLY mode and report whether it flags issues. READ-ONLY.
+    # Available on OS build > 17600. Surfaces problems Microsoft's own engine sees that our explicit checks may not. Never remediates here.
+    function Test-WaaSMedic {
+        [CmdletBinding()]
+        param ()
+
+        if ([System.Environment]::OSVersion.Version.Build -le 17600) {
+            return [PSCustomObject]@{ Supported = $false; IssuesDetected = $false; Detail = "WaaSMedic not supported on this OS build." }
+        }
+
+        $waaS = $null
+        try {
+            $waaS = New-Object -ComObject "Microsoft.WaaSMedic.1"
+        } catch {
+            return [PSCustomObject]@{ Supported = $false; IssuesDetected = $false; Detail = "WaaSMedic COM object unavailable." }
+        }
+
+        try {
+            $plugins = $waaS.LaunchDetectionOnly("Troubleshooter")
+            $hasIssues = -not [string]::IsNullOrWhiteSpace("$plugins")
+            return [PSCustomObject]@{
+                Supported      = $true
+                IssuesDetected = $hasIssues
+                Detail         = if ($hasIssues) { "Plugins reporting possible issues: $plugins" } else { "No issues detected." }
+            }
+        } catch {
+            return [PSCustomObject]@{ Supported = $true; IssuesDetected = $false; Detail = "WaaSMedic detection failed: $($_.Exception.Message)" }
+        } finally {
+            if ($waaS) { try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($waaS) | Out-Null } catch { } }
+        }
+    }
+
+    # Function to force a system-time resync (-ResyncSystemTime). Low-risk repair for the clock-skew-breaks-TLS cause above. It starts W32Time
+    # and runs 'w32tm /resync /force'. It does NOT reconfigure the time source (that would fight Group Policy on a healthy domain box); on a
+    # dead-domain/off-network device the resync will simply fail to reach its source, which is reported rather than worked around.
+    function Invoke-TimeResync {
+        [CmdletBinding()]
+        param ()
+
+        try { Start-Service -Name "W32Time" -ErrorAction Stop } catch { Write-Host -Object "[Warning] Could not start the W32Time service: $($_.Exception.Message)" }
+
+        $output = & "$env:SystemRoot\System32\w32tm.exe" "/resync" "/force" 2>&1 | Out-String
+        $succeeded = ($LASTEXITCODE -eq 0)
+
+        if ($succeeded) {
+            Write-Host -Object "[Info] System time resynchronized successfully."
+        } else {
+            Write-Host -Object "[Warning] 'w32tm /resync' did not succeed (exit code $LASTEXITCODE). On a dead-domain / off-network device this is expected - there's no reachable time source. Output:"
+            Write-Host -Object ($output.Trim() -replace "^", "[Warning]   ")
+        }
+
+        return $succeeded
+    }
+
+    # Function to repair a corrupt component store (-RepairComponentStore): DISM /Online /Cleanup-Image /RestoreHealth, then sfc /scannow.
+    # This is the actual "repair" for update failures caused by servicing-stack/component-store corruption (distinct from the WSUS-source problem).
+    # NOTE: RestoreHealth reaches out to Windows Update for replacement files, so on a device whose update source is broken it can be slow or fail
+    # unless a local source is provided; that's reported. Both steps are long-running - size the RMM script timeout accordingly.
+    function Invoke-ComponentStoreRepair {
+        [CmdletBinding()]
+        param ()
+
+        $result = [PSCustomObject]@{ DismSucceeded = $false; SfcSucceeded = $false }
+
+        Write-Host -Object "[Info] Running 'DISM /Online /Cleanup-Image /RestoreHealth' (this can take several minutes)..."
+        $dismOutput = & "$env:SystemRoot\System32\Dism.exe" "/online" "/Cleanup-Image" "/RestoreHealth" 2>&1 | Out-String
+        $result.DismSucceeded = ($LASTEXITCODE -eq 0)
+        if ($result.DismSucceeded) {
+            Write-Host -Object "[Info] DISM RestoreHealth completed successfully."
+        } else {
+            Write-Host -Object "[Warning] DISM RestoreHealth returned exit code $LASTEXITCODE. If this device's update source is broken, DISM may be unable to fetch replacement files without a -Source. Output tail:"
+            Write-Host -Object (($dismOutput.Trim() -split "`r?`n" | Select-Object -Last 5) -join "`n")
+        }
+
+        Write-Host -Object "[Info] Running 'sfc /scannow' (this can take several minutes)..."
+        $null = & "$env:SystemRoot\System32\sfc.exe" "/scannow" 2>&1 | Out-String
+        $result.SfcSucceeded = ($LASTEXITCODE -eq 0)
+        if ($result.SfcSucceeded) {
+            Write-Host -Object "[Info] sfc /scannow completed (exit code 0)."
+        } else {
+            Write-Host -Object "[Warning] sfc /scannow returned exit code $LASTEXITCODE. Review CBS.log ($env:SystemRoot\Logs\CBS\CBS.log) for detail."
+        }
+
+        return $result
+    }
+
+    # Function to shrink the WinSxS component store (-CleanupComponentStore): DISM /Online /Cleanup-Image /StartComponentCleanup, and, only when
+    # -ResetBase is ALSO specified, /ResetBase. ResetBase is destructive: after it runs, existing updates and service packs can no longer be
+    # uninstalled - hence it's a separate, default-off sub-option rather than part of the standard cleanup.
+    function Invoke-ComponentStoreCleanup {
+        [CmdletBinding()]
+        param (
+            [switch]$ResetBase
+        )
+
+        $dismArgs = @("/online", "/Cleanup-Image", "/StartComponentCleanup")
+        if ($ResetBase) {
+            $dismArgs += "/ResetBase"
+            Write-Host -Object "[Info] Running DISM component cleanup WITH /ResetBase (existing updates will no longer be uninstallable after this)..."
+        } else {
+            Write-Host -Object "[Info] Running DISM component cleanup (/StartComponentCleanup)..."
+        }
+
+        $output = & "$env:SystemRoot\System32\Dism.exe" @dismArgs 2>&1 | Out-String
+        $succeeded = ($LASTEXITCODE -eq 0)
+
+        if ($succeeded) {
+            Write-Host -Object "[Info] DISM component cleanup completed successfully."
+        } else {
+            Write-Host -Object "[Warning] DISM component cleanup returned exit code $LASTEXITCODE. Output tail:"
+            Write-Host -Object (($output.Trim() -split "`r?`n" | Select-Object -Last 5) -join "`n")
+        }
+
+        return $succeeded
+    }
+
+    # Function to trigger Windows' own WaaSMedic remediation (-RunWaaSMedic) via its scheduled task, letting the OS attempt to self-heal update
+    # components. This is the remediation counterpart to Test-WaaSMedic's detection. Non-disruptive, but opaque about exactly what it changes.
+    function Invoke-WaaSMedicRemediation {
+        [CmdletBinding()]
+        param ()
+
+        $task = Get-ScheduledTask -TaskPath "\Microsoft\Windows\WaaSMedic\" -TaskName "PerformRemediation" -ErrorAction SilentlyContinue
+        if (-not $task) {
+            Write-Host -Object "[Warning] The WaaSMedic 'PerformRemediation' scheduled task was not found on this device; cannot trigger self-healing."
+            return $false
+        }
+
+        try {
+            Start-ScheduledTask -TaskPath "\Microsoft\Windows\WaaSMedic\" -TaskName "PerformRemediation" -ErrorAction Stop
+            Write-Host -Object "[Info] Triggered the WaaSMedic 'PerformRemediation' task; Windows will attempt to self-heal update components in the background."
+            return $true
+        } catch {
+            Write-Host -Object "[Warning] Could not start the WaaSMedic 'PerformRemediation' task: $($_.Exception.Message)"
+            return $false
+        }
     }
 
     # Function to test if a device is domain-joined
@@ -1433,34 +1812,33 @@ process {
         }
     }
 
-    # If requested, test connectivity to Microsoft's Windows Update endpoints. Independent of the registry/GPO state above, since it's checking whether the network path to
-    # Microsoft is even open - relevant both before and after -RemoveWSUSSettings, since an environment that only ever firewalled traffic to the internal WSUS server will
-    # still fail to reach Microsoft even with a perfectly clean registry
-    $connectivityResults = $null
-    if ($TestWindowsUpdateConnectivity) {
-        Write-Host -Object "`n[Info] Testing connectivity to Windows Update endpoints..."
-        $connectivityResults = Test-WindowsUpdateConnectivity
+    # Test connectivity to Microsoft's Windows Update endpoints. Read-only (DNS + TCP probes only), so - like the other diagnostics in this
+    # section - it always runs; there's no reason to gate a side-effect-free check behind a switch. Independent of the registry/GPO state
+    # above, since it's checking whether the network path to Microsoft is even open - relevant both before and after -RemoveWSUSSettings,
+    # since an environment that only ever firewalled traffic to the internal WSUS server will still fail to reach Microsoft even with a
+    # perfectly clean registry.
+    Write-Host -Object "`n[Info] Testing connectivity to Windows Update endpoints..."
+    $connectivityResults = Test-WindowsUpdateConnectivity
 
-        foreach ($result in $connectivityResults) {
-            if ($result.TCPConnected) {
-                Write-Host -Object "[Info] Reachable: $($result.Hostname):$($result.Port)"
-            } elseif (-not $result.DNSResolved) {
-                Write-Host -Object "[Warning] DNS resolution failed for $($result.Hostname). This can indicate a DNS server or proxy configuration issue."
-            } else {
-                Write-Host -Object "[Warning] Unable to reach $($result.Hostname) on port $($result.Port). This can indicate a firewall or proxy blocking Windows Update traffic."
-            }
-        }
-
-        # Wrapped in @() so Where-Object returning zero or one match still yields a real array - otherwise a zero-match result is $null and $null.Count silently renders as blank instead of 0
-        $unreachableEndpoints = @($connectivityResults | Where-Object { -not $_.TCPConnected })
-        $reachableCount = @($connectivityResults | Where-Object { $_.TCPConnected }).Count
-        $totalEndpointCount = @($connectivityResults).Count
-
-        if ($unreachableEndpoints) {
-            Write-Host -Object "[Warning] $($unreachableEndpoints.Count) of $totalEndpointCount Windows Update endpoints could not be reached. If this device previously relied on WSUS exclusively, outbound firewall/proxy rules may need to be updated to allow direct access to Microsoft's update servers."
+    foreach ($result in $connectivityResults) {
+        if ($result.TCPConnected) {
+            Write-Host -Object "[Info] Reachable: $($result.Hostname):$($result.Port)"
+        } elseif (-not $result.DNSResolved) {
+            Write-Host -Object "[Warning] DNS resolution failed for $($result.Hostname). This can indicate a DNS server or proxy configuration issue."
         } else {
-            Write-Host -Object "[Info] All $totalEndpointCount tested Windows Update endpoints are reachable."
+            Write-Host -Object "[Warning] Unable to reach $($result.Hostname) on port $($result.Port). This can indicate a firewall or proxy blocking Windows Update traffic."
         }
+    }
+
+    # Wrapped in @() so Where-Object returning zero or one match still yields a real array - otherwise a zero-match result is $null and $null.Count silently renders as blank instead of 0
+    $unreachableEndpoints = @($connectivityResults | Where-Object { -not $_.TCPConnected })
+    $reachableCount = @($connectivityResults | Where-Object { $_.TCPConnected }).Count
+    $totalEndpointCount = @($connectivityResults).Count
+
+    if ($unreachableEndpoints) {
+        Write-Host -Object "[Warning] $($unreachableEndpoints.Count) of $totalEndpointCount Windows Update endpoints could not be reached. If this device previously relied on WSUS exclusively, outbound firewall/proxy rules may need to be updated to allow direct access to Microsoft's update servers."
+    } else {
+        Write-Host -Object "[Info] All $totalEndpointCount tested Windows Update endpoints are reachable."
     }
 
     # Inspect the FULL contents of the Windows Update policy key, not just the WSUS server trio checked above. Several other policy values in
@@ -1518,6 +1896,23 @@ process {
                 Write-Host -Object "[Warning]   $($service.Name) - Service URL: $(if ($service.ServiceUrl) { $service.ServiceUrl } else { 'n/a (endpoint recorded in the agent datastore / WindowsUpdate.log)' })"
             }
             Write-Host -Object "[Warning] A managed WSUS binding does NOT clear by removing the registry settings or resetting the cache. It clears only when the device completes a Group Policy cycle against a reachable domain controller (on-site or VPN) with no WSUS configured, or when the device is removed from the domain."
+
+            # READ-ONLY intel: find where each flagged service's registration physically lives in the registry. If it's registry-backed, that
+            # key is the target for a future non-disruptive, DC-free removal (delete the registration + restart wuauserv). If NOTHING is found,
+            # the binding lives only in the protected datastore - which, given it also survived a SoftwareDistribution rename, means a DC policy
+            # cycle or domain change is genuinely the only way to clear it. This is diagnostic only; it changes nothing.
+            foreach ($service in $boundNonMicrosoftServices) {
+                $footprint = Get-UpdateServiceRegistryFootprint -ServiceId $service.ServiceID
+                if ($footprint -and $footprint.Count -gt 0) {
+                    Write-Host -Object "[Info] Registry footprint for '$($service.Name)' (ServiceID $($service.ServiceID)) - candidate targets for a local, DC-free removal:"
+                    foreach ($hit in $footprint) {
+                        $suffix = if ($hit.Data) { " = $($hit.Data)" } else { "" }
+                        Write-Host -Object "[Info]   $($hit.Path)  [$($hit.Where)]$suffix"
+                    }
+                } else {
+                    Write-Host -Object "[Info] No registry footprint found for '$($service.Name)' in the Windows Update registry trees - its registration appears to live only in the agent datastore, so a local registry deletion is not available; clearing it needs a DC policy cycle or a domain change."
+                }
+            }
         } else {
             Write-Host -Object "[Info] The agent is bound only to Microsoft's update service(s); no stale WSUS/third-party service registration was found."
         }
@@ -1557,6 +1952,61 @@ process {
         }
     }
 
+    # Read-only general Windows Update health checks (always run) - the broader "diagnose" half of the tool, independent of WSUS.
+
+    # Last successful scan date - the clearest single "is this device actually patching?" signal.
+    Write-Host -Object "`n[Info] Checking the date of the last successful Windows Update scan..."
+    $lastScanDate = Get-LastUpdateScanInfo
+    if ($null -eq $lastScanDate) {
+        Write-Host -Object "[Warning] No record of a successful Windows Update scan was found (the device may never have completed one, or the record was reset)."
+        $lastScanDisplay = "Never"
+    } else {
+        $lastScanLocal = $lastScanDate.ToLocalTime()
+        $daysSinceScan = [math]::Round(((Get-Date) - $lastScanLocal).TotalDays, 0)
+        $lastScanDisplay = $lastScanLocal.ToString("yyyy-MM-dd")
+        if ($daysSinceScan -gt 30) {
+            Write-Host -Object "[Warning] The last successful scan was $lastScanDisplay ($daysSinceScan days ago) - this device is not patching on schedule."
+        } else {
+            Write-Host -Object "[Info] The last successful scan was $lastScanDisplay ($daysSinceScan days ago)."
+        }
+    }
+
+    # Recent Windows Update error codes from the event log - hard evidence of what the agent is actually hitting (e.g. 0x80240438).
+    Write-Host -Object "`n[Info] Checking the event log for recent Windows Update error codes..."
+    $wuErrorCodes = @(Get-WindowsUpdateEventErrors -Days 7)
+    if ($wuErrorCodes.Count -gt 0) {
+        Write-Host -Object "[Warning] Windows Update recorded these error code(s) in the last 7 days: $($wuErrorCodes -join ', ')"
+    } else {
+        Write-Host -Object "[Info] No Windows Update error events were found in the last 7 days."
+    }
+
+    # Time sync - a skewed clock breaks TLS to Microsoft's endpoints and mimics a connectivity failure.
+    Write-Host -Object "`n[Info] Checking the system time synchronization configuration..."
+    $timeSyncType = Get-TimeSyncStatus
+    $timeSyncIsConcern = $false
+    if ($timeSyncType -eq "NoSync") {
+        $timeSyncIsConcern = $true
+        Write-Host -Object "[Warning] Time synchronization is OFF (W32Time Type = NoSync). A drifting clock breaks TLS to Microsoft's update servers, which looks like a connectivity failure. Consider -ResyncSystemTime."
+    } elseif ($timeSyncType -eq "NT5DS" -and $IsDomainJoined -and $DomainControllerReachable -eq $false) {
+        $timeSyncIsConcern = $true
+        Write-Host -Object "[Warning] Time sync is set to domain hierarchy (NT5DS) but no domain controller is reachable, so the clock cannot sync and may drift. On a dead-domain device this silently breaks TLS to update servers over time."
+    } elseif ($timeSyncType) {
+        Write-Host -Object "[Info] Time synchronization type: $timeSyncType."
+    } else {
+        Write-Host -Object "[Info] Could not read the time synchronization type."
+    }
+
+    # WaaSMedic - Windows' own update self-healing detector.
+    Write-Host -Object "`n[Info] Running Windows' built-in update self-healing detector (WaaSMedic, detection only)..."
+    $waaSMedic = Test-WaaSMedic
+    if (-not $waaSMedic.Supported) {
+        Write-Host -Object "[Info] WaaSMedic is not available on this device ($($waaSMedic.Detail))."
+    } elseif ($waaSMedic.IssuesDetected) {
+        Write-Host -Object "[Warning] WaaSMedic detected potential update issues: $($waaSMedic.Detail)"
+    } else {
+        Write-Host -Object "[Info] WaaSMedic detected no update issues."
+    }
+
     # If requested, remove the WSUS settings from the registry. This runs before the custom field is written, since the field should reflect the end result of this run, not the pre-removal snapshot already shown above
     if ($RemoveWSUSSettings) {
         Write-Host -Object "`n[Info] Removing WSUS settings from the registry..."
@@ -1578,11 +2028,57 @@ process {
         }
     }
 
+    # If requested, force-remove the stuck managed binding directly from the registry. This is the LAST-RESORT, local, DC-free path for a
+    # permanently-orphaned device where the COM unregister above was refused (0x8024801A) and no DC will ever be reachable. It only deletes a
+    # registry key named with the service GUID (backing it up first), or does nothing if no such key exists. Runs AFTER the COM attempt (so the
+    # clean path gets first crack) and BEFORE the cache reset (so the datastore rebuilds clean on top of the corrected registry).
+    $forceRemoveResult = $null
+    if ($ForceRemoveManagedBinding) {
+        if ($boundNonMicrosoftServices) {
+            Write-Host -Object "`n[Info] Force-removing the managed WSUS/third-party binding directly from the registry (last resort; each key is backed up to a .reg file first)..."
+            $forceRemoveResult = Remove-ManagedBindingFromRegistry -Services $boundNonMicrosoftServices
+        } else {
+            Write-Host -Object "`n[Info] No stale WSUS/third-party binding was detected; nothing to force-remove."
+        }
+    }
+
     # If requested, reset the Windows Update cache so the agent rebuilds it from scratch instead of continuing to reference anything tied to the old WSUS server
     $cacheResetSucceeded = $null
     if ($ResetWindowsUpdateCache) {
         Write-Host -Object "`n[Info] Resetting the Windows Update cache..."
         $cacheResetSucceeded = Reset-WindowsUpdateCache
+    }
+
+    # General Windows Update repairs (opt-in), independent of the WSUS cleanup above.
+
+    # -ResyncSystemTime: fix clock skew that breaks TLS to Microsoft's update endpoints.
+    $timeResyncSucceeded = $null
+    if ($ResyncSystemTime) {
+        Write-Host -Object "`n[Info] Resynchronizing the system time..."
+        $timeResyncSucceeded = Invoke-TimeResync
+    }
+
+    # -RepairComponentStore: DISM /RestoreHealth + sfc /scannow, for update failures caused by component-store corruption.
+    $componentRepairResult = $null
+    if ($RepairComponentStore) {
+        Write-Host -Object "`n[Info] Repairing the Windows component store (DISM RestoreHealth + SFC)..."
+        $componentRepairResult = Invoke-ComponentStoreRepair
+    }
+
+    # -CleanupComponentStore: DISM /StartComponentCleanup (+ /ResetBase only if -ResetBase is also set).
+    $componentCleanupSucceeded = $null
+    if ($CleanupComponentStore) {
+        Write-Host -Object "`n[Info] Cleaning up the Windows component store..."
+        $componentCleanupSucceeded = Invoke-ComponentStoreCleanup -ResetBase:$ResetBase
+    } elseif ($ResetBase) {
+        Write-Host -Object "`n[Warning] -ResetBase was specified without -CleanupComponentStore; it has no effect on its own and was ignored. Enable -CleanupComponentStore to use it."
+    }
+
+    # -RunWaaSMedic: trigger Windows' own update self-healing remediation.
+    $waaSMedicTriggered = $null
+    if ($RunWaaSMedic) {
+        Write-Host -Object "`n[Info] Triggering WaaSMedic self-healing remediation..."
+        $waaSMedicTriggered = Invoke-WaaSMedicRemediation
     }
 
     # Re-audit the bound update services so the console + custom field reflect the post-remediation state.
@@ -1594,7 +2090,7 @@ process {
     # WSUS entry still shows up. So we judge success by AU-binding, and report a lingering-but-dormant WSUS entry as fixed, not blocked.
     $finalBoundNonMicrosoftServices = $boundNonMicrosoftServices
     $finalAUBoundConcerns = $boundNonMicrosoftServices
-    if ($UnregisterStaleUpdateServices -and $boundNonMicrosoftServices) {
+    if (($UnregisterStaleUpdateServices -or $ForceRemoveManagedBinding) -and $boundNonMicrosoftServices) {
         $finalRegisteredServices = Get-RegisteredUpdateServices
         $finalBoundNonMicrosoftServices = @($finalRegisteredServices | Where-Object { $_.IsConcern })
         # The subset that is still the actual AU scan source - the only state that keeps a scan failing 0x80240438
@@ -1602,7 +2098,11 @@ process {
 
         if ($finalAUBoundConcerns) {
             Write-Host -Object "[Warning] A WSUS/third-party service is STILL the Automatic Updates scan source after the attempt: $(($finalAUBoundConcerns | ForEach-Object { $_.Name }) -join ', '). Microsoft Update could not be made the default locally - this is a managed registration the agent won't release while it's domain-joined and can't see a DC."
-            Write-Host -Object "[Warning] This is an environmental limit, not a script failure, and no non-disruptive local action can force it. Clearing it requires either a Group Policy cycle against a reachable DC (get the device on-site/VPN once), OR removing the device from the domain - the latter is a deliberate, planned maintenance step and must NOT be done to a device in the field / in front of a user. Flag this device for that follow-up rather than acting on it live."
+            if ($ForceRemoveManagedBinding) {
+                Write-Host -Object "[Warning] The direct registry force-removal (-ForceRemoveManagedBinding) also did not clear it - see the force-removal output above for whether the registration key was missing (datastore-only), access-denied (SYSTEM/TrustedInstaller-owned), or deleted-but-rebuilt. In all three cases the remaining options are a Group Policy cycle against a reachable DC, or a domain change."
+            } else {
+                Write-Host -Object "[Warning] Clearing it requires either a Group Policy cycle against a reachable DC (get the device on-site/VPN once), OR removing the device from the domain - the latter is a deliberate, planned maintenance step and must NOT be done to a device in the field / in front of a user. If the read-only registry footprint above shows a GUID-named key, -ForceRemoveManagedBinding can attempt a local, reversible deletion of just that key."
+            }
         } elseif ($finalBoundNonMicrosoftServices) {
             Write-Host -Object "[Info] A WSUS service registration still exists, but it is NO LONGER the Automatic Updates scan source - Microsoft Update is now bound to AU, so scans will go to Microsoft. The leftover registration is dormant and harmless (it fully clears on a Group Policy cycle against a DC, or when the device leaves the domain)."
         } else {
@@ -1678,19 +2178,44 @@ process {
             [void]$customFieldValue.Append(" | Local Blockers: $(($scanBlockingLocal | ForEach-Object { $_.Category }) -join ', ')")
         }
 
+        # 2c) Actual Windows Update error codes from the event log - hard evidence (e.g. 0x80240438). High value, ranks near the top.
+        if ($wuErrorCodes.Count -gt 0) {
+            [void]$customFieldValue.Append(" | WU Errors: $($wuErrorCodes -join ', ')")
+        }
+
         # 3) Result of the unregister action, if it was requested. Judge it by whether the binding is actually gone now - NOT by the COM
         # call's return - since a managed binding can't be removed locally; report that it needs a DC/domain change rather than "Failed".
         # Judge by AU-binding, not mere registration: if Microsoft Update is now the AU scan source, the device is fixed even if a
         # dormant WSUS registration lingers ("Cleared"). "Dormant" = fixed for scanning but a leftover entry remains; "Blocked" = WSUS
         # is still the AU scan source and only a domain removal / DC policy cycle will clear it.
-        if ($UnregisterStaleUpdateServices -and $boundNonMicrosoftServices) {
+        if (($UnregisterStaleUpdateServices -or $ForceRemoveManagedBinding) -and $boundNonMicrosoftServices) {
             $unregisterVerdict = if ($finalAUBoundConcerns) { 'Blocked-NeedsDomainLeave' } elseif ($finalBoundNonMicrosoftServices) { 'Cleared-DormantEntry' } else { 'Cleared' }
             [void]$customFieldValue.Append(" | Unregister: $unregisterVerdict")
+        }
+
+        # 3b) Result of the direct registry force-removal, if it was requested - compact so it doesn't crowd the 199-char field. Deleted =
+        # a registration key was removed; NoRegKey = none existed (datastore-only); AccessDenied = key exists but is SYSTEM/TrustedInstaller-owned.
+        if ($ForceRemoveManagedBinding -and $forceRemoveResult) {
+            $forceVerdict = if ($forceRemoveResult.Deleted -gt 0) { "Deleted $($forceRemoveResult.Deleted)" } elseif ($forceRemoveResult.AccessDenied -gt 0) { 'AccessDenied' } else { 'NoRegKey' }
+            [void]$customFieldValue.Append(" | ForceRemove: $forceVerdict")
         }
 
         # 4) DC reachability context (domain-joined only) - explains whether a managed WSUS binding can be expected to clear on this run
         if ($null -ne $DomainControllerReachable) {
             [void]$customFieldValue.Append(" | DC: $(if ($DomainControllerReachable) { 'Reachable' } else { 'Unreachable' })")
+        }
+
+        # 4b) Last successful scan date - the headline "is it patching?" metric.
+        [void]$customFieldValue.Append(" | Last Scan: $lastScanDisplay")
+
+        # 4c) Time-sync concern (only when actually a concern, to conserve the 199-char budget).
+        if ($timeSyncIsConcern) {
+            [void]$customFieldValue.Append(" | TimeSync: $timeSyncType")
+        }
+
+        # 4d) WaaSMedic detection (only when it flags something).
+        if ($waaSMedic.Supported -and $waaSMedic.IssuesDetected) {
+            [void]$customFieldValue.Append(" | WaaSMedic: Issues")
         }
 
         # 5) Metered-connection flag - only appended when the connection is actually metered (the common non-metered case
@@ -1705,8 +2230,23 @@ process {
             [void]$customFieldValue.Append(" | Cache Reset: $(if ($cacheResetSucceeded) { 'Completed' } else { 'Failed' })")
         }
 
-        # 7) Windows Update endpoint connectivity count (full per-endpoint breakdown is in the console output)
-        if ($connectivityResults) {
+        # 6b) General repair results, each only when its switch ran - compact so they don't crowd the field.
+        if ($null -ne $timeResyncSucceeded) {
+            [void]$customFieldValue.Append(" | TimeResync: $(if ($timeResyncSucceeded) { 'OK' } else { 'Failed' })")
+        }
+        if ($null -ne $componentRepairResult) {
+            [void]$customFieldValue.Append(" | CompRepair: DISM $(if ($componentRepairResult.DismSucceeded) { 'OK' } else { 'Fail' })/SFC $(if ($componentRepairResult.SfcSucceeded) { 'OK' } else { 'Fail' })")
+        }
+        if ($null -ne $componentCleanupSucceeded) {
+            [void]$customFieldValue.Append(" | CompCleanup: $(if ($componentCleanupSucceeded) { 'OK' } else { 'Failed' })$(if ($ResetBase) { ' (ResetBase)' })")
+        }
+        if ($null -ne $waaSMedicTriggered) {
+            [void]$customFieldValue.Append(" | WaaSMedicRun: $(if ($waaSMedicTriggered) { 'Triggered' } else { 'Failed' })")
+        }
+
+        # 7) Windows Update endpoint connectivity - now an always-run diagnostic, so only surface it in the field when something is actually
+        # unreachable (all-reachable is the common case and isn't worth the character budget); full per-endpoint detail is always in the console.
+        if ($unreachableEndpoints) {
             [void]$customFieldValue.Append(" | WU Connectivity: $reachableCount/$totalEndpointCount reachable")
         }
 
