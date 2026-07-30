@@ -107,6 +107,8 @@ $params = @{
     Priority                              = 0
     ExceptIfHeaderContainsMessageHeader   = 'x-ms-exchange-meetingforward-message'
     ExceptIfHeaderContainsWords           = 'Forward'
+    ExceptIfHeaderMatchesMessageHeader    = 'X-MS-Exchange-CrossTenant-AuthAs'
+    ExceptIfHeaderMatchesPatterns         = 'Internal'
     ExceptIfMessageTypeMatches            = 'Voicemail'
 }
 
