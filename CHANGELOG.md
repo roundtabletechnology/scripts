@@ -4,6 +4,11 @@ All notable changes to this repository are documented here. Entries are grouped 
 
 ## 2026-08-19
 
+### Mac/Security - Get FileVault Key (fix - wrong ninjarmm-cli path)
+- Fixed `ninjarmm-cli` being invoked at `/Applications/NinjaRMMAgent.app/Contents/MacOS/ninjarmm-cli`, which does not exist on the Mac agent - confirmed failing in production (`No such file or directory`). Switched to the correct path (`/Applications/NinjaRMMAgent/programdata/ninjarmm-cli`) used by every other Mac script in the repo.
+- The custom field write now skips quietly with a console warning if the CLI still can't be found, instead of the script erroring out.
+- `ninja_set` now surfaces the actual `ninjarmm-cli` error on failure instead of swallowing stderr, so a bad field write is visible in the console output rather than looking identical to success.
+
 ### Mac/Security - Get FileVault Status (update - publish to Ninja custom field)
 - `Get FileVault Status.sh` now publishes the FileVault status (e.g. `FileVault is On`) to the `diskEncryptionStatus` Ninja custom field via `ninjarmm-cli`, in addition to printing it to stdout as before.
 - Uses the correct CLI path (`/Applications/NinjaRMMAgent/programdata/ninjarmm-cli`), matching every other Mac script in the repo, and warns instead of failing if the CLI isn't found.

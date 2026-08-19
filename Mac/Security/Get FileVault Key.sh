@@ -19,6 +19,21 @@
 
 # Configuration
 NINJA_CUSTOM_FIELD="diskEncryptionKey"
+NINJA_CLI="/Applications/NinjaRMMAgent/programdata/ninjarmm-cli"
+
+# Publishes a value to the Ninja custom field, skipping quietly if the CLI isn't present
+ninja_set() {
+    if [[ -f "$NINJA_CLI" ]]; then
+        cli_error=$("$NINJA_CLI" set "$NINJA_CUSTOM_FIELD" "$1" 2>&1 >/dev/null)
+        if [[ $? -eq 0 ]]; then
+            echo "Published '$1' to Ninja custom field: $NINJA_CUSTOM_FIELD"
+        else
+            echo "Failed to write Ninja custom field '$NINJA_CUSTOM_FIELD': $cli_error"
+        fi
+    else
+        echo "ninjarmm-cli not found at $NINJA_CLI - skipping Ninja field write."
+    fi
+}
 
 # Check if running as root
 if [[ $EUID -ne 0 ]]; then
@@ -31,7 +46,7 @@ fv_status=$(fdesetup status)
 
 if [[ $fv_status == *"FileVault is Off"* ]]; then
     echo "FileVault is not enabled"
-    /Applications/NinjaRMMAgent.app/Contents/MacOS/ninjarmm-cli set "$NINJA_CUSTOM_FIELD" "FileVault Not Enabled"
+    ninja_set "FileVault Not Enabled"
     exit 0
 fi
 
@@ -67,4 +82,4 @@ echo "  - iCloud Keychain (if that option was selected)"
 echo "  - Your organization's MDM system"
 echo "  - A text file saved during initial setup"
 
-/Applications/NinjaRMMAgent.app/Contents/MacOS/ninjarmm-cli set "$NINJA_CUSTOM_FIELD" "FileVault Enabled - Key Not Retrievable via CLI"
+ninja_set "FileVault Enabled - Key Not Retrievable via CLI"
