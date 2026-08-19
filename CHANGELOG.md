@@ -4,6 +4,12 @@ All notable changes to this repository are documented here. Entries are grouped 
 
 ## 2026-08-19
 
+### Windows/OS/Security - Get BitLocker Status (new script)
+- Adds `Get BitLocker Status.ps1` to report the system drive's BitLocker encryption state and publish it to the `diskEncryptionStatus` Ninja custom field as `BitLocker <VolumeStatus>` (e.g. `BitLocker FullyEncrypted`, `BitLocker FullyDecrypted`), using `Get-BitLockerVolume`.
+- Complements the existing `Get BitLocker Key.ps1`, which publishes the recovery key to a separate `diskEncryptionKey` field.
+- Confirmed working via a live NinjaOne test run.
+- Updated `Windows/README.md` script index.
+
 ### Mac/Security - Get FileVault Key (fix - wrong ninjarmm-cli path)
 - Fixed `ninjarmm-cli` being invoked at `/Applications/NinjaRMMAgent.app/Contents/MacOS/ninjarmm-cli`, which does not exist on the Mac agent - confirmed failing in production (`No such file or directory`). Switched to the correct path (`/Applications/NinjaRMMAgent/programdata/ninjarmm-cli`) used by every other Mac script in the repo.
 - The custom field write now skips quietly with a console warning if the CLI still can't be found, instead of the script erroring out.

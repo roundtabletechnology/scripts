@@ -161,6 +161,7 @@ Scripts are organized into subfolders by function. For guidance on downloading a
 | [Enable SMB Guest Logon.ps1](OS/Security/Enable%20SMB%20Guest%20Logon.ps1) | Re-enables SMB guest access (use with caution) |
 | [Enable UAC.bat](OS/Security/Enable%20UAC.bat) | Re-enables User Account Control via registry |
 | [Get BitLocker Key.ps1](OS/Security/Get%20BitLocker%20Key.ps1) | Retrieves the BitLocker recovery key for the system drive |
+| [Get BitLocker Status.ps1](OS/Security/Get%20BitLocker%20Status.ps1) | Reports the current BitLocker encryption status for the system drive |
 | [Set Execution Policy.ps1](OS/Security/Set%20Execution%20Policy.ps1) | Sets the PowerShell execution policy for the machine or current user |
 
 ### OS — User Management
