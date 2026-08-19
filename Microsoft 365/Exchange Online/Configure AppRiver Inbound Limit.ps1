@@ -78,8 +78,10 @@ Write-Output "It may be helpful to include a client's static WAN IP address in c
 $additionalIPsInput = Read-Host "Enter any additional IP addresses or subnets (comma-delimited), or press Enter to skip:"
 
 # Append additional IPs to the array if provided
+# Strip anything but digits/dots/slashes to guard against invisible Unicode
+# formatting characters (e.g. LRM/RLM marks) that can ride along with pasted text.
 if ($additionalIPsInput.Trim()) {
-    $additionalIPs = $additionalIPsInput -split ',' | ForEach-Object { $_.Trim() }
+    $additionalIPs = $additionalIPsInput -split ',' | ForEach-Object { $_ -replace '[^0-9./]', '' } | Where-Object { $_ }
     $appRiverIPs += $additionalIPs
 }
 
