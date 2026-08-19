@@ -4,6 +4,11 @@ All notable changes to this repository are documented here. Entries are grouped 
 
 ## 2026-08-19
 
+### HOWTO.md (new section - troubleshooting NinjaOne custom field writes)
+- Added a "Troubleshooting NinjaOne Custom Field Writes" section after real-world testing showed a script finding the CLI and printing the right value but still not updating the field. That specific case turned out to be the stale `.app`-path bug fixed in `Get FileVault Status.sh`/`Get FileVault Key.sh` above, but the section documents the full set of causes so future cases can be diagnosed faster.
+- Covers: running as root/SYSTEM being required (ninjarmm-cli/Ninja-Property-Set live in protected locations), field write permissions needing to be Read/Write for Automations, exact (case-sensitive) field name matching, read-only field types (Attachment, Device/Organization drop-downs), and the risk of scripts that suppress stderr from Ninja CLI calls hiding the real error.
+- References NinjaOne's official CLI documentation.
+
 ### Windows/OS/Security - Get BitLocker Status (new script)
 - Adds `Get BitLocker Status.ps1` to report the system drive's BitLocker encryption state and publish it to the `diskEncryptionStatus` Ninja custom field as `BitLocker <VolumeStatus>` (e.g. `BitLocker FullyEncrypted`, `BitLocker FullyDecrypted`), using `Get-BitLockerVolume`.
 - Complements the existing `Get BitLocker Key.ps1`, which publishes the recovery key to a separate `diskEncryptionKey` field.

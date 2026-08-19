@@ -151,6 +151,20 @@ Many scripts also read NinjaOne environment variables as an alternative to param
 
 ---
 
+## Troubleshooting NinjaOne Custom Field Writes
+
+If a script runs cleanly and prints the right value to the console, but the NinjaOne custom field never updates, check these in order:
+
+1. **The script must run as root/SYSTEM.** Both `Ninja-Property-Set` (Windows) and `ninjarmm-cli` (Mac/Linux) live in locations regular users can't access. When testing manually on a Mac, run with `sudo`; on Windows, run PowerShell as Administrator. Scripts deployed through NinjaOne itself already run at SYSTEM/root, so this only bites during manual testing.
+2. **The custom field's permissions must allow write access from scripts.** In NinjaOne, open the field's settings and confirm the *Automations*/*Scripting* permission is set to **Read/Write**, not Read-Only. A read-only field silently discards writes.
+3. **The field name must match exactly** (case-sensitive) the name used in `Ninja-Property-Set` / `ninjarmm-cli set`, not the human-readable label shown in the UI.
+4. **The field type must support writes.** Most types (Text, Checkbox, Dropdown, etc.) are read/write, but a few (Attachment, Device drop-down/multi-select, Organization drop-down/multi-select) are read-only via the CLI/API regardless of permission settings.
+5. **Don't suppress stderr while debugging.** Several scripts in this repo redirect `ninjarmm-cli`/`Ninja-Property-Set` errors to `/dev/null` or `$null` so a missing agent doesn't fail the whole script. That also hides the real error (e.g., permission denied) if the field write fails for another reason - temporarily remove the redirect to see the actual message.
+
+On Mac specifically, the CLI binary is at `/Applications/NinjaRMMAgent/programdata/ninjarmm-cli` (not under `NinjaRMMAgent.app`). Reference: [NinjaOne CLI: Custom Fields and Documentation Scripting](https://www.ninjaone.com/docs/scripting-and-automation/command-line-interface-cli/cli-custom-fields-documentation-scripting/).
+
+---
+
 ## Questions or Issues
 
 If a script doesn't behave as expected, open its file in GitHub and check whether a more recent version exists (compare the `git log` or the file's commit history). If you find a bug or want to suggest an improvement, see [CONTRIBUTING.md](CONTRIBUTING.md).
