@@ -52,7 +52,7 @@ See [HOWTO.md](../HOWTO.md) for guidance on downloading and running scripts.
 | [Detect CVE CloudMensis.sh](Security/Detect%20CVE%20CloudMensis.sh) | Checks for indicators of the CloudMensis macOS spyware |
 | [Detect MDM Enrollment.sh](Security/Detect%20MDM%20Enrollment.sh) | Reports whether the device is enrolled in an MDM platform |
 | [Get FileVault Key.sh](Security/Get%20FileVault%20Key.sh) | Retrieves the FileVault recovery key for the device |
-| [Get FileVault Status.sh](Security/Get%20FileVault%20Status.sh) | Reports the current FileVault encryption status |
+| [Get FileVault Status.sh](Security/Get%20FileVault%20Status.sh) | Reports the current FileVault encryption status and publishes it to the diskEncryptionStatus Ninja custom field |
 
 ---
 
