@@ -9,39 +9,39 @@
     the provided MSI installer URL.
 
     NinjaOne agents cannot install over an existing NinjaOne agent, so the incumbent
-    must be removed first. Because removing the agent tears down the process tree that
-    a NinjaOne script runs inside, the install cannot happen inline - it is handed to a
-    Scheduled Task that runs outside this script's process tree. NinjaOne's own GPO
-    deployment tooling uses the same pattern, gated on service absence.
+    must be removed first.
 
-    WHY A SCHEDULED TASK, WHEN UPSTREAM REMOVED THEIRS:
-    The community script this one descends from (see .NOTES) dropped its scheduled task
-    on 2025-12-30 after several users reported the reinstall "working on some systems and
-    not on others" - the same symptom that prompted this rewrite. That was never
-    diagnosed upstream. The cause is almost certainly that both upstream task versions
-    called New-ScheduledTask with NO -Settings argument, inheriting the Task Scheduler
-    defaults: DisallowStartIfOnBatteries and StopIfGoingOnBatteries are True and
-    StartWhenAvailable is False. A desktop installs, a laptop on battery never does, and
-    a trigger missed while the device was asleep is dropped instead of run late. So the
-    task is kept here and every one of those settings is now set explicitly (see
-    Register-InstallTask) - it is the only design that survives a reboot and retries.
+    ARCHITECTURE - why nothing destructive happens in this process:
+    Removing the agent tears down the process tree that a NinjaOne script runs inside, so
+    any work done inline after the uninstall starts can be killed halfway through. This
+    script therefore never touches the agent itself. It only prepares, then hands the
+    whole transfer to a Scheduled Task, which the Task Scheduler service owns - outside
+    the agent's process tree entirely - and exits.
 
-    Upstream's replacement is to write the work to a .ps1, launch it with a detached
-    Start-Process (no -Wait), and exit immediately so no live process tree remains to be
-    killed. That is faster (removal starts in ~1 minute rather than 5) but has no retry
-    at all: if the child dies or the device reboots, nothing tries again.
+      PREPARE phase (this process, run by NinjaOne, non-destructive):
+        1. Validate the installer URL and any token, and preflight the host.
+        2. Survey the incumbent agent and record its product codes.
+        3. Download and rigorously validate the MSI. Nothing is touched until this passes.
+        4. Copy this script and the config to a durable state directory.
+        5. Register the transfer task, start it, and exit.
 
-    KNOWN LIMITATION: the removal below still runs inline in this process, which is the
-    one the agent teardown can kill. If that happens partway through Uninstall-NinjaMSI,
-    the cleanup after it is skipped and the install task will take its "agent gone, no
-    signal" branch and install over a partially-cleaned machine. Moving the removal into
-    the task alongside the install would close this; it is a deliberate open item.
+      TRANSFER phase (the Scheduled Task, as SYSTEM, survives the teardown):
+        6. Remove the incumbent agent, bounded by -MaxRemovalMinutes.
+        7. Install the new agent and verify the service actually appears.
+        8. Unregister the task only once the install is verified; retry otherwise.
 
-    Order of operations - the machine is never left without a path to an agent:
-      1. Download and rigorously validate the MSI. Nothing is touched until this passes.
-      2. Write the install helper and register the Scheduled Task (with retries).
-      3. Remove the incumbent agent.
-      4. Signal removal completion so the task can proceed immediately.
+    ONE TASK, NOT TWO: separating removal and install into two tasks was considered and
+    rejected. Two independently retrying tasks can interleave, and a removal retry that
+    fires after a successful install would delete the BRAND-NEW agent - name-based
+    cleanup cannot tell the two instances apart. Running both phases in one process makes
+    the ordering structural rather than something flags have to coordinate. The one
+    benefit two tasks would have had - the install still proceeding while removal hangs -
+    is kept by bounding the removal phase with a deadline and by timing out msiexec.
+
+    RETRY SAFETY: the incumbent's product codes are recorded during PREPARE, so a retry
+    can tell the OLD agent from the NEW one by product code rather than by name, and
+    removal is skipped entirely once the incumbent is gone. That is what makes it safe for
+    the task to keep retrying.
 
     Installer URL precedence (highest to lowest):
       1. Ninja script variable "installerUrl"  ($env:installerUrl)
@@ -49,26 +49,53 @@
       3. $NewMSPInstallerURL hardcoded in this script
 
 .PARAMETER InstallerURL
-    Full HTTPS URL to the new MSP's NinjaOne MSI installer for the target organization.
-    Obtain from: New MSP NinjaOne > Administration > Installer > Windows Agent > Generate Installer.
-    Select the correct customer organization before generating.
+    Full HTTPS URL to the new MSP's NinjaOne MSI installer. Two kinds of URL work:
+
+    PREFERRED - a per-organization installer, generated for the target customer:
+      New MSP NinjaOne > Administration > Installer > Windows Agent > Generate Installer.
+      Select the correct customer organization before generating. The organization is
+      baked into the MSI, so no token is needed.
+
+    ALTERNATIVE - the generic installer plus -InstallerToken. Useful when one automation
+      has to cover many organizations, at the cost of the organization no longer being
+      self-evident from the URL.
+
+.PARAMETER InstallerToken
+    Organization installer token (a GUID), used ONLY with the generic installer. Passed to
+    msiexec as TOKENID. Leave empty when using a per-organization installer URL, which is
+    the preferred approach. May also be supplied as the Ninja script variable "token" or
+    "installerToken".
+
+    For a FedRAMP instance this must instead be the ClientUID, and -HostURL is required;
+    the pair is then passed as CLIENTUID and HOST.
+
+.PARAMETER HostURL
+    FedRAMP instance host URL. Only needed when migrating to a FedRAMP instance, and only
+    valid together with -InstallerToken (carrying the ClientUID). May also be supplied as
+    the Ninja script variable "hostUrl".
 
 .PARAMETER InstallDelayMinutes
-    Minutes to wait before the install task first fires. Default 5. The task does not
-    rely on this delay being long enough - it waits for the removal to signal completion
-    (see -MaxRemovalWaitMinutes) and retries on a schedule regardless.
+    Delay before the transfer task's fallback trigger fires. Default 2. The task is also
+    started immediately at the end of the PREPARE phase, so this only matters if that
+    immediate start fails.
 
-.PARAMETER MaxRemovalWaitMinutes
-    How long the install task waits for removal to finish before installing anyway.
-    Default 30. It also proceeds early once the incumbent agent has actually gone, so
-    this ceiling only applies if this script is killed before it can signal completion.
+.PARAMETER MaxRemovalMinutes
+    Budget for the removal phase. Default 20. Once exceeded, the remaining cleanup stages
+    are skipped and the install proceeds anyway - a machine with a possibly-imperfect
+    agent is far better than a machine with none. Also caps how long msiexec /x may run.
+    Aliased to -MaxRemovalWaitMinutes for compatibility with 2.x.
 
 .PARAMETER RetryWindowHours
-    How long the install task keeps retrying if the install fails. Default 4.
+    How long the transfer task keeps retrying if the install fails. Default 4.
 
 .PARAMETER DryRun
     Validate the installer URL, report what would be removed, and exit without changing
     anything. Use this to confirm the URL and survey a machine before committing.
+
+.PARAMETER Phase
+    Internal. 'Prepare' (default) is the NinjaOne-side run. 'Transfer' is how the
+    Scheduled Task re-invokes the copy of this script in the state directory to do the
+    removal and install. Do not pass this by hand except to reproduce a failure.
 
 .EXAMPLE
     .\Reinstall NinjaRMM Agent.ps1
@@ -77,6 +104,14 @@
 
 .EXAMPLE
     .\Reinstall NinjaRMM Agent.ps1 -InstallerURL 'https://app.ninjarmm.com/agent/installer/...'
+
+    Per-organization installer - the preferred form.
+
+.EXAMPLE
+    .\Reinstall NinjaRMM Agent.ps1 -InstallerURL 'https://.../ninjaone-agent.msi' -InstallerToken '00000000-0000-0000-0000-000000000000'
+
+    Generic installer plus an organization token, for covering many organizations from
+    one automation.
 
 .EXAMPLE
     .\Reinstall NinjaRMM Agent.ps1 -DryRun
@@ -108,16 +143,47 @@
     That is the supported path. This script is the fallback for when the incumbent
     will not cooperate, the device is offline in their console, or the agent is corrupt.
 
+    --- OPTION 3: Generic installer plus a token (many organizations, one automation) ---
+    Add a second Script Variable named "token" (or "installerToken") and supply the
+    organization's installer token with the generic installer URL. A per-organization
+    URL is still preferred - it needs no secret and the target organization is evident
+    from the URL - but the token path is supported for bulk transfers.
+
+    --- WHY A SCHEDULED TASK, WHEN UPSTREAM REMOVED THEIRS ---
+    The community script this one descends from (see REFERENCES) dropped its scheduled
+    task on 2025-12-30 after several users reported the reinstall "working on some
+    systems and not on others" - the same symptom that prompted this rewrite. It was
+    never diagnosed upstream. The cause is almost certainly that both upstream task
+    versions called New-ScheduledTask with NO -Settings argument, inheriting the Task
+    Scheduler defaults: DisallowStartIfOnBatteries and StopIfGoingOnBatteries are True
+    and StartWhenAvailable is False. A desktop installs, a laptop on battery never does,
+    and a trigger missed while the device was asleep is dropped instead of run late. So
+    the task is kept here and every one of those settings is set explicitly (see
+    Register-TransferTask) - it is the only design that survives a reboot and retries.
+
+    Upstream's replacement was to launch a detached child process and exit immediately so
+    no live process tree remains to be killed. That is fast but has no retry at all: if
+    the child dies or the device reboots, nothing tries again. A Scheduled Task started
+    immediately gives the same detachment plus reboot survival and retry, which is why
+    this script starts the task rather than spawning a child.
+
     --- TROUBLESHOOTING A FAILED TRANSFER ---
     Everything is logged to a durable location that survives the agent removal:
-      C:\ProgramData\RTT\NinjaAgentTransfer\transfer.log   (this script)
-      C:\ProgramData\RTT\NinjaAgentTransfer\install.log    (the install task)
+      C:\ProgramData\RTT\NinjaAgentTransfer\transfer.log     (PREPARE, this process)
+      C:\ProgramData\RTT\NinjaAgentTransfer\transfer-task.log (TRANSFER, the task)
+      C:\ProgramData\RTT\NinjaAgentTransfer\msi-uninstall.log
       C:\ProgramData\RTT\NinjaAgentTransfer\msi-install.log
-    That folder also holds the MSI and the install helper. It is deliberately NOT
-    cleaned up on failure so a failed machine can be diagnosed after the fact.
+    That folder also holds the validated MSI, the copy of this script the task runs, and
+    transfer.json (the recorded incumbent product codes and install settings). It is
+    deliberately NOT cleaned up on failure so a failed machine can be diagnosed later.
+    The directory is ACLed to SYSTEM and Administrators because transfer.json can hold
+    an installer token.
 
-    --- CANCELING THE INSTALL TASK ---
-    Unregister-ScheduledTask -TaskName 'NinjaRMM-NewAgentInstall' -Confirm:$false
+    To re-run just the destructive half by hand on a failed machine:
+      & 'C:\ProgramData\RTT\NinjaAgentTransfer\Transfer-NinjaAgent.ps1' -Phase Transfer
+
+    --- CANCELING THE TRANSFER TASK ---
+    Unregister-ScheduledTask -TaskName 'NinjaRMM-AgentTransfer' -Confirm:$false
 
     --- REFERENCES ---
     NinjaOne Agent Removal (official custom script)
@@ -139,12 +205,18 @@
 # found on a neglected server. The check is done at runtime below instead, so an
 # under-privileged run produces a clear message rather than a syntax error.
 
+
 param (
     [string]$InstallerURL,
-    [int]$InstallDelayMinutes   = 5,
-    [int]$MaxRemovalWaitMinutes = 30,
-    [int]$RetryWindowHours      = 4,
-    [switch]$DryRun
+    [string]$InstallerToken,
+    [string]$HostURL,
+    [int]$InstallDelayMinutes = 2,
+    [Alias('MaxRemovalWaitMinutes')]
+    [int]$MaxRemovalMinutes   = 20,
+    [int]$RetryWindowHours    = 4,
+    [switch]$DryRun,
+    [ValidateSet('Prepare', 'Transfer')]
+    [string]$Phase            = 'Prepare'
 )
 
 # ==============================================================================
@@ -154,8 +226,12 @@ param (
 $NewMSPInstallerURL = ''
 # ==============================================================================
 
-$ScriptVersion = '2.0.1'
-$TaskName      = 'NinjaRMM-NewAgentInstall'
+$ScriptVersion   = '3.0.0'
+$TaskName        = 'NinjaRMM-AgentTransfer'
+# 2.x registered an install-only task under this name. It is unregistered during PREPARE
+# so a machine that was part-way through a 2.x transfer cannot end up with both tasks
+# racing each other.
+$LegacyTaskName  = 'NinjaRMM-NewAgentInstall'
 
 # Identifies the agent itself, as opposed to other Ninja-branded products that can share
 # the machine (a real device carried "NinjaRMM Desktop Companion x64" alongside two
@@ -177,16 +253,35 @@ $ErrorActionPreference = 'Stop'
 
 # --- Durable state directory ---
 # Must live outside every path the removal deletes (notably $env:ProgramData\NinjaRMMAgent)
-# so the MSI, the install helper and the logs all survive the agent teardown.
-$StateDir        = Join-Path $env:ProgramData 'RTT\NinjaAgentTransfer'
-$LogFile         = Join-Path $StateDir 'transfer.log'
-$MsiPath         = Join-Path $StateDir 'NinjaAgentInstall.msi'
-$HelperPs1       = Join-Path $StateDir 'Install-NinjaAgent.ps1'
-$RemovalDoneFlag = Join-Path $StateDir 'removal.done'
-$InstallDoneFlag = Join-Path $StateDir 'install.done'
+# so the MSI, the script copy, the config and the logs all survive the agent teardown.
+$StateDir          = Join-Path $env:ProgramData 'RTT\NinjaAgentTransfer'
+$LogFile           = Join-Path $StateDir $(if ($Phase -eq 'Transfer') { 'transfer-task.log' } else { 'transfer.log' })
+$MsiPath           = Join-Path $StateDir 'NinjaAgentInstall.msi'
+$SelfCopyPath      = Join-Path $StateDir 'Transfer-NinjaAgent.ps1'
+$ConfigPath        = Join-Path $StateDir 'transfer.json'
+$RemovalDoneFlag   = Join-Path $StateDir 'removal.done'
+$InstallDoneFlag   = Join-Path $StateDir 'install.done'
+$InstallTriedFlag  = Join-Path $StateDir 'install.attempted'
 
 if (-not (Test-Path -LiteralPath $StateDir)) {
     New-Item -ItemType Directory -Path $StateDir -Force | Out-Null
+}
+
+# Restrict the state directory to SYSTEM and Administrators. transfer.json can hold an
+# installer token, and ProgramData is world-readable by default. Best-effort: a failure
+# here must not stop a transfer, so it only warns.
+try {
+    $acl = Get-Acl -LiteralPath $StateDir
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($sid in @('S-1-5-18', 'S-1-5-32-544')) {
+        $account = (New-Object System.Security.Principal.SecurityIdentifier($sid))
+        $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+            $account, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+    }
+    Set-Acl -LiteralPath $StateDir -AclObject $acl
+} catch {
+    # Deliberately silent here - Write-Log is not defined yet. Reported during preflight.
+    $script:StateDirAclError = $_.Exception.Message
 }
 
 # Writes a timestamped, leveled line to the console AND to a durable log file. NinjaOne
@@ -222,7 +317,6 @@ function Get-NativeSystem32 {
     }
     return (Join-Path $env:SystemRoot 'System32')
 }
-
 # ==============================================================================
 # DOWNLOAD AND VALIDATION
 # ==============================================================================
@@ -841,11 +935,40 @@ function Uninstall-NinjaMSI {
         'WRAPPED_ARGUMENTS="--mode unattended"'
     )
     Write-Log "Running: msiexec.exe /x$ProductCode (log: $msiLog)"
-    $proc = Start-Process 'msiexec.exe' -ArgumentList $msiArgs -Wait -NoNewWindow -PassThru
-    Write-Log "msiexec exited with code $($proc.ExitCode)."
+
+    # Bounded rather than -Wait. A hung msiexec is the single most likely way for the
+    # removal phase to stall, and an unbounded wait would let it consume the whole task
+    # execution limit and take the install down with it. The bound is whatever is left of
+    # the removal budget, clamped so it is never absurdly short or long.
+    $remainingMs = 10 * 60 * 1000
+    if ($script:RemovalDeadline) {
+        $remainingMs = [int]([Math]::Max(60000, ($script:RemovalDeadline - (Get-Date)).TotalMilliseconds))
+    }
+    $remainingMs = [Math]::Min($remainingMs, 15 * 60 * 1000)
+
+    # System.Diagnostics.Process directly, NOT Start-Process. Start-Process -PassThru
+    # WITHOUT -Wait hands back an object whose ExitCode is never populated (verified on
+    # 5.1: WaitForExit returns True and ExitCode is empty), and -Wait cannot be bounded.
+    # Going one level down is the only way to get both a timeout and a real exit code -
+    # and the exit code carries information worth keeping: 1605 means it was already gone.
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName        = 'msiexec.exe'
+    $psi.Arguments       = ($msiArgs -join ' ')
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow  = $true
+
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    if (-not $proc.WaitForExit($remainingMs)) {
+        Write-Log "msiexec did not finish within $([int]($remainingMs / 60000)) minute(s). Terminating it and continuing with the manual cleanup." -Level Warning
+        try { $proc.Kill() } catch { }
+        Start-Sleep 5
+        return
+    }
+    $exitCode = $proc.ExitCode
+    Write-Log "msiexec exited with code $exitCode."
     # 0 = success, 1605 = not installed (already gone), 3010 = success, reboot required.
-    if ($proc.ExitCode -notin @(0, 1605, 3010)) {
-        Write-Log "Unexpected msiexec exit code $($proc.ExitCode) - continuing with manual cleanup." -Level Warning
+    if ($exitCode -notin @(0, 1605, 3010)) {
+        Write-Log "Unexpected msiexec exit code $exitCode - continuing with manual cleanup." -Level Warning
     }
     # Let background agent processes terminate before file and registry cleanup.
     Start-Sleep 30
@@ -922,166 +1045,65 @@ function Remove-NRDisplayDriver {
 }
 
 # ==============================================================================
-# INSTALL TASK
+# TRANSFER TASK
 # ==============================================================================
 
-# The install helper that the Scheduled Task runs. Written to disk rather than passed as
-# an -EncodedCommand so it is inspectable on a failed machine and not subject to
-# command-line length limits.
-$InstallHelperScript = @'
-param (
-    [Parameter(Mandatory = $true)][string]$MsiPath,
-    [Parameter(Mandatory = $true)][string]$StateDir,
-    [int]$MaxRemovalWaitMinutes = 30,
-    [string]$TaskName = 'NinjaRMM-NewAgentInstall'
-)
-
-$ErrorActionPreference = 'Continue'
-$ProgressPreference    = 'SilentlyContinue'
-
-$log             = Join-Path $StateDir 'install.log'
-$removalDoneFlag = Join-Path $StateDir 'removal.done'
-$installDoneFlag = Join-Path $StateDir 'install.done'
-
-# Write-Host rather than Write-Output, for the same reason as the parent script: keeping
-# log lines out of the success pipeline so they can never contaminate a function's
-# return value.
-function Write-InstallLog {
-    param ([string]$Message)
-    $line = '[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message
-    Write-Host $line
-    try { Add-Content -LiteralPath $log -Value $line -Encoding UTF8 -ErrorAction Stop } catch { }
-}
-
-# Detects whether the AGENT is still installed. Deliberately scoped to the agent rather
-# than to anything named 'Ninja': a machine can carry other Ninja-branded products (e.g.
-# "NinjaRMM Desktop Companion x64") that this transfer leaves in place by design. Matching
-# those would make this function report the agent as still present forever, which would
-# block the early-exit below and fire a spurious "still present" warning on every run.
-function Test-NinjaInstalled {
-    if (Get-Service 'NinjaRMMAgent' -ErrorAction SilentlyContinue) { return $true }
-    $agentPattern = '^NinjaRMMAgent$|NinjaOne\s*Agent|^NinjaRMM\s*Agent$'
-    $views = if ([Environment]::Is64BitOperatingSystem) { @('Registry64', 'Registry32') } else { @('Registry32') }
-    foreach ($viewName in $views) {
-        try {
-            $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
-                [Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::$viewName)
-            $un = $base.OpenSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall')
-            if ($un) {
-                foreach ($n in $un.GetSubKeyNames()) {
-                    $s = $un.OpenSubKey($n)
-                    if ($s) {
-                        $dn = [string]$s.GetValue('DisplayName')
-                        $s.Close()
-                        if ($dn -match $agentPattern) { $un.Close(); $base.Close(); return $true }
-                    }
-                }
-                $un.Close()
-            }
-            $base.Close()
-        } catch { }
-    }
-    return $false
-}
-
-function Complete-Task {
-    param ([string]$Reason)
-    Write-InstallLog $Reason
-    New-Item -ItemType File -Path $installDoneFlag -Force | Out-Null
-    try {
-        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop
-        Write-InstallLog "Scheduled task '$TaskName' unregistered."
-    } catch {
-        Write-InstallLog "Could not unregister the task: $($_.Exception.Message)"
-    }
-}
-
-Write-InstallLog '--- Install task fired ---'
-
-if (Test-Path -LiteralPath $installDoneFlag) {
-    Complete-Task 'The install already completed on an earlier run. Nothing to do.'
-    exit 0
-}
-
-# Wait for the removal phase to finish before installing. This is what makes the fixed
-# delay non-load-bearing: rather than assuming removal fits in a set number of minutes,
-# the task waits for an explicit signal. Without this the task could fire mid-cleanup, and
-# the name-based cleanup would then delete the BRAND-NEW agent's service, files and
-# registry keys - the removal has no way to tell the two instances apart.
+# Builds the msiexec property arguments for the install.
 #
-# The wait also ends early once the incumbent agent has actually gone, which covers the
-# case where the parent script was killed by the agent teardown before it could write the
-# signal. If neither condition is met, the install proceeds anyway on timeout: a machine
-# with a possibly-imperfect agent is far better than a machine with none.
-$deadline = (Get-Date).AddMinutes($MaxRemovalWaitMinutes)
-while ((Get-Date) -lt $deadline) {
-    if (Test-Path -LiteralPath $removalDoneFlag) {
-        Write-InstallLog 'Removal signalled complete.'
-        break
-    }
-    if (-not (Test-NinjaInstalled)) {
-        Write-InstallLog 'The incumbent agent is gone with no completion signal - the removal script was probably terminated. Proceeding.'
-        break
-    }
-    Start-Sleep -Seconds 15
+# A per-organization installer needs none - the organization is baked into the MSI, which
+# is why it is the preferred form. The generic installer needs a token, and a FedRAMP
+# instance needs the ClientUID/HOST pair instead.
+function Get-MsiInstallProperties {
+    param (
+        [string]$Token,
+        [string]$FedRampHost
+    )
+    if (-not $Token) { return @() }
+    if ($FedRampHost) { return @("CLIENTUID=$Token", "HOST=$FedRampHost") }
+    return @("TOKENID=$Token")
 }
 
-if (-not (Test-Path -LiteralPath $removalDoneFlag) -and (Test-NinjaInstalled)) {
-    Write-InstallLog "WARNING: waited $MaxRemovalWaitMinutes minute(s) and a Ninja agent is still present. Installing anyway; if this fails, the incumbent agent was not fully removed."
-}
-
-# AV and endpoint protection can quarantine or delete a downloaded installer AFTER the
-# download reported success, so the file is re-checked immediately before it is used.
-if (-not (Test-Path -LiteralPath $MsiPath)) {
-    Write-InstallLog "ERROR: the installer is missing from $MsiPath (deleted or quarantined?). Cannot install."
-    exit 1
-}
-$msiLen = (Get-Item -LiteralPath $MsiPath).Length
-if ($msiLen -lt 1MB) {
-    Write-InstallLog "ERROR: the installer at $MsiPath is only $msiLen bytes. Refusing to run it."
-    exit 1
-}
-
-$msiexecLog = Join-Path $StateDir 'msi-install.log'
-Write-InstallLog "Installing the agent from $MsiPath ($msiLen bytes)..."
-$proc = Start-Process 'msiexec.exe' `
-    -ArgumentList @('/i', "`"$MsiPath`"", '/quiet', '/norestart', '/L*V', "`"$msiexecLog`"") `
-    -Wait -NoNewWindow -PassThru
-Write-InstallLog "msiexec exited with code $($proc.ExitCode)."
-
-# Verify the agent is actually present rather than trusting the exit code. This is the
-# check that turns a silent failure into a visible one.
-$verifyDeadline = (Get-Date).AddMinutes(5)
-$installed = $false
-while ((Get-Date) -lt $verifyDeadline) {
-    $svc = Get-Service 'NinjaRMMAgent' -ErrorAction SilentlyContinue
-    if ($svc) {
-        if ($svc.Status -ne 'Running') { try { Start-Service 'NinjaRMMAgent' -ErrorAction SilentlyContinue } catch { } }
-        $installed = $true
-        break
-    }
-    Start-Sleep -Seconds 10
-}
-
-if ($installed) {
-    $svc = Get-Service 'NinjaRMMAgent' -ErrorAction SilentlyContinue
-    Complete-Task "SUCCESS: the NinjaRMMAgent service is present (status: $($svc.Status)). The device should check in shortly."
-    Remove-Item -LiteralPath $MsiPath -Force -ErrorAction SilentlyContinue
-    exit 0
-}
-
-# Leave the task registered so its repetition trigger retries. Exiting non-zero also
-# surfaces the failure in the task's Last Run Result.
-Write-InstallLog "FAILURE: the NinjaRMMAgent service did not appear after the install (msiexec exit $($proc.ExitCode)). See $msiexecLog. The task will retry."
-exit 1
-'@
-
-# Registers the one-time-plus-retry Scheduled Task that installs the new agent as SYSTEM.
+# Validates the URL/token combination before anything is downloaded or removed.
 #
-# The task is the sole install path: it runs outside this script's process tree, so it
-# survives the MSI uninstaller terminating this process. NinjaOne's scripting engine runs
-# inside the Ninja process tree, and the entire tree is torn down when the agent is
-# removed. The MSI is already on disk before this is called, so the task needs no network.
+# Deliberately more permissive than upstream, which hard-fails when the URL does not
+# contain a GUID path segment. That heuristic cannot be trusted to hold for every
+# per-organization URL NinjaOne generates, and failing closed on it would break the
+# primary path. So the genuinely contradictory combinations are fatal and the
+# shape-based suspicion is only a warning.
+function Test-InstallerConfig {
+    param (
+        [string]$Url,
+        [string]$Token,
+        [string]$FedRampHost
+    )
+    # A generated per-organization URL carries a GUID path segment.
+    $perOrgPattern = '/[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}'
+    $looksPerOrg   = $Url -match $perOrgPattern
+
+    if ($Token) {
+        if ($Token -notmatch '^\{?[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}\}?$') {
+            Write-Log 'The installer token is not a GUID. Check it was pasted whole and without quotes.' -Level Error
+            return $false
+        }
+        if ($looksPerOrg) {
+            Write-Log 'A token was supplied with what looks like a per-organization installer URL. The token will be passed anyway, but a per-organization installer does not need one - confirm which you meant.' -Level Warning
+        }
+        Write-Log "Install mode: generic installer with a token$(if ($FedRampHost) { ' (FedRAMP: CLIENTUID/HOST)' } else { ' (TOKENID)' })."
+    } else {
+        if ($FedRampHost) {
+            Write-Log 'A FedRAMP HostURL was supplied with no token. A FedRAMP migration needs the generic installer, the HostURL, and the ClientUID in -InstallerToken.' -Level Error
+            return $false
+        }
+        if (-not $looksPerOrg) {
+            Write-Log 'This URL does not look like a generated per-organization installer, and no token was supplied. If it is the generic installer the agent may install but never register to an organization.' -Level Warning
+        }
+        Write-Log "Install mode: no token$(if ($looksPerOrg) { ' (per-organization installer)' } else { ' (URL shape not recognised)' })."
+    }
+    return $true
+}
+
+# Registers the transfer task: one task that removes the incumbent agent and installs the
+# new one, running as SYSTEM outside this script's process tree.
 #
 # The settings and triggers here are load-bearing, and each is a fix for a way the
 # previous version silently failed to install:
@@ -1094,26 +1116,24 @@ exit 1
 #       Defaults to False, meaning a trigger missed because the machine was off, asleep or
 #       rebooting at the appointed minute is skipped permanently rather than run late.
 #   AtStartup trigger
-#       Covers a reboot during removal (the MSI uninstall can request one).
+#       Covers a reboot during the transfer (the MSI uninstall can request one).
 #   Repetition on the Once trigger
 #       Retries on a schedule, so a transient failure self-heals instead of leaving the
-#       machine with no agent. The helper unregisters the task once it verifies success,
+#       machine with no agent. The task unregisters itself once it verifies the install,
 #       so the repetition costs nothing on a healthy machine.
-function Register-InstallTask {
+#   -ExecutionTimeLimit
+#       Must comfortably exceed the removal budget plus the install and verification, or
+#       the service kills the run mid-transfer.
+function Register-TransferTask {
     param (
-        [string]$MsiPath,
-        [string]$StateDir,
-        [string]$HelperPath,
+        [string]$ScriptPath,
         [int]$DelayMinutes,
-        [int]$MaxRemovalWaitMinutes,
-        [int]$RetryWindowHours
+        [int]$RetryWindowHours,
+        [int]$MaxRemovalMinutes
     )
 
-    Set-Content -LiteralPath $HelperPath -Value $InstallHelperScript -Encoding UTF8 -Force
-
     $arguments = '-ExecutionPolicy Bypass -NoProfile -NonInteractive -WindowStyle Hidden ' +
-                 "-File `"$HelperPath`" -MsiPath `"$MsiPath`" -StateDir `"$StateDir`" " +
-                 "-MaxRemovalWaitMinutes $MaxRemovalWaitMinutes -TaskName `"$TaskName`""
+                 "-File `"$ScriptPath`" -Phase Transfer"
 
     $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arguments
 
@@ -1127,12 +1147,13 @@ function Register-InstallTask {
         Write-Log 'Could not add a startup trigger; the timed trigger alone will be used.' -Level Warning
     }
 
+    $limit = New-TimeSpan -Minutes ($MaxRemovalMinutes + 30)
     $settings = New-ScheduledTaskSettingsSet `
         -AllowStartIfOnBatteries `
         -DontStopIfGoingOnBatteries `
         -StartWhenAvailable `
         -MultipleInstances IgnoreNew `
-        -ExecutionTimeLimit (New-TimeSpan -Hours 1)
+        -ExecutionTimeLimit $limit
 
     $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
 
@@ -1140,120 +1161,88 @@ function Register-InstallTask {
     Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $triggers `
         -Settings $settings -Principal $principal -Force -ErrorAction Stop | Out-Null
 
-    Write-Log ("Install task registered. First attempt at approximately {0}, then retrying every 15 minutes for up to {1} hour(s) until the agent is verified." -f `
-        (Get-Date).AddMinutes($DelayMinutes).ToString('HH:mm:ss'), $RetryWindowHours) -Level Success
+    Write-Log ("Transfer task registered (execution limit {0}). Fallback trigger at approximately {1}, then retrying every 15 minutes for up to {2} hour(s) until the agent is verified." -f `
+        $limit, (Get-Date).AddMinutes($DelayMinutes).ToString('HH:mm:ss'), $RetryWindowHours) -Level Success
     Write-Log "To cancel: Unregister-ScheduledTask -TaskName '$TaskName' -Confirm:`$false"
 }
 
-# ==============================================================================
-# MAIN
-# ==============================================================================
-
-Write-Log "=== Reinstall NinjaRMM Agent v$ScriptVersion ==="
-
-# --- Resolve the installer URL ---
-if ($env:installerUrl) { $InstallerURL = $env:installerUrl }
-if (-not $InstallerURL -and $NewMSPInstallerURL) { $InstallerURL = $NewMSPInstallerURL }
-
-if (-not $InstallerURL) {
-    Write-Log 'No installer URL provided. Set $NewMSPInstallerURL in the script, pass -InstallerURL, or configure the "installerUrl" Ninja script variable.' -Level Error
-    exit 1
-}
-if ($InstallerURL -notmatch '^https://') {
-    Write-Log "The installer URL must be HTTPS. Got: $InstallerURL" -Level Error
-    exit 1
-}
-
-# --- Preflight ---
-# Reported up front because these are the variables that determine which of the known
-# failure modes apply, and this log is what gets read when a machine goes quiet.
-$isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
-           ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-
-Write-Log "PowerShell : $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition))"
-Write-Log "OS         : $((Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).Caption)"
-Write-Log "Process    : $(if ([Environment]::Is64BitProcess) { '64-bit' } else { '32-bit' }) on $(if ([Environment]::Is64BitOperatingSystem) { '64-bit' } else { '32-bit' }) Windows"
-Write-Log "Identity   : $([Security.Principal.WindowsIdentity]::GetCurrent().Name) (elevated: $isAdmin)"
-Write-Log "State dir  : $StateDir"
-
-if ($PSVersionTable.PSVersion.Major -lt 3) {
-    Write-Log "PowerShell $($PSVersionTable.PSVersion) is not supported - this script needs 3.0 or later for the ScheduledTasks cmdlets." -Level Error
-    exit 1
-}
-if (-not $isAdmin) {
-    Write-Log 'This script must run elevated (as SYSTEM or an administrator).' -Level Error
-    exit 1
-}
-if (-not (Get-Command Register-ScheduledTask -ErrorAction SilentlyContinue)) {
-    Write-Log 'The ScheduledTasks module is unavailable, so the install could not be made to survive the agent removal. Refusing to proceed - removing the agent now would leave this device unmanaged.' -Level Error
-    exit 1
-}
-
-try {
-    # --- Survey the incumbent agent ---
-    # Note there can legitimately be MORE THAN ONE agent uninstall entry, each with its
-    # own product code (observed on a real machine: two NinjaRMMAgent registrations).
-    # Every one of them must be uninstalled - leaving a stray MSI product record behind is
-    # the one documented cause of a subsequent agent install refusing to proceed.
-    $allNinja        = @(Get-NinjaUninstallEntries)
-    $entries         = @($allNinja | Where-Object { $_.IsAgent })
-    $otherProducts   = @($allNinja | Where-Object { -not $_.IsAgent })
-    $installLocation = Get-NinjaInstallLocation
-
-    if ($entries.Count -eq 0) {
-        Write-Log 'No NinjaOne agent was found in the registry. Treating this as a clean install.' -Level Warning
-    } else {
-        foreach ($e in $entries) {
-            $pc = if ($e.ProductCode) { $e.ProductCode } else { '<could not parse>' }
-            Write-Log "Found agent: '$($e.DisplayName)' $($e.DisplayVersion) [$($e.View)] ProductCode=$pc"
-        }
-        if ($entries.Count -gt 1) {
-            Write-Log "$($entries.Count) agent registrations are present; all of them will be uninstalled."
-        }
+# Returns the uninstall entries belonging to the INCUMBENT agent.
+#
+# This is the guard that makes retrying safe. Product codes recorded during PREPARE
+# identify the old agent exactly, so a retry that fires after a successful install finds
+# nothing to remove instead of destroying the agent it just installed. Name matching
+# cannot make that distinction - both agents are called NinjaRMMAgent.
+#
+# When PREPARE recorded no product codes (a corrupt install with no uninstall entry) there
+# is nothing to match on, so every agent entry is returned and the caller's run-once flags
+# are what prevent a second pass.
+function Get-IncumbentEntries {
+    param ([string[]]$ProductCodes)
+    $agents = @(Get-NinjaUninstallEntries | Where-Object { $_.IsAgent })
+    if ($ProductCodes -and @($ProductCodes).Count -gt 0) {
+        return @($agents | Where-Object { $_.ProductCode -and ($ProductCodes -contains $_.ProductCode) })
     }
+    return $agents
+}
 
-    # Other Ninja-branded products are reported but deliberately left alone: they have
-    # their own product codes, do not block an agent install, and blindly removing
-    # anything matching 'Ninja' on an unfamiliar fleet risks collateral damage.
-    foreach ($o in $otherProducts) {
-        Write-Log "Other Ninja product found (NOT removed - review if the install fails): '$($o.DisplayName)' $($o.DisplayVersion) [$($o.View)]" -Level Warning
+# Decides whether the removal phase should run. This is the single most safety-critical
+# decision in the script, so it is a pure function of four observable facts and is tested
+# directly rather than only through a live transfer.
+#
+#   1. A recorded incumbent product code is still registered -> remove it. This is exact:
+#      it cannot match an agent that this script installed.
+#   2. Nothing was recorded, and neither removal nor install has been attempted -> run the
+#      cleanup once anyway, because a corrupt install can leave files, services and
+#      registry keys behind with no uninstall entry at all.
+#   3. Otherwise -> skip. In particular, once the install has been ATTEMPTED, removal must
+#      never run again: if verification failed after msiexec had actually succeeded, a
+#      retry that ran removal would delete the agent it just installed.
+function Test-RemovalRequired {
+    param (
+        [int]$IncumbentCount,
+        [int]$RecordedCodeCount,
+        [bool]$RemovalDone,
+        [bool]$InstallAttempted
+    )
+    if ($IncumbentCount -gt 0) { return $true }
+    if ($RecordedCodeCount -eq 0 -and -not $RemovalDone -and -not $InstallAttempted) { return $true }
+    return $false
+}
+
+# True when the removal phase has run out of time. Called at stage boundaries so a
+# long-running stage cannot push the install past the point of usefulness.
+function Test-RemovalExpired {
+    param ([string]$NextStage)
+    if ($script:RemovalDeadline -and (Get-Date) -ge $script:RemovalDeadline) {
+        Write-Log "Removal budget exhausted - skipping: $NextStage" -Level Warning
+        return $true
     }
+    return $false
+}
 
-    Write-Log "Install location: $(if ($installLocation) { $installLocation } else { '<not found>' })"
+# Removes the incumbent agent. Runs in the TRANSFER phase only - never in the process
+# NinjaOne launched, which is the whole point of the redesign.
+#
+# $Deadline bounds the phase. Cleanup stages check it and bail out to let the install
+# proceed, because a machine with a possibly-imperfect agent is far better than a machine
+# with none. This is what preserves the one advantage a separate install task would have
+# had: a hung removal can no longer prevent the install.
+function Invoke-AgentRemoval {
+    param (
+        [object[]]$Entries,
+        [string]$InstallLocation,
+        [datetime]$Deadline
+    )
 
-    Write-OrphanedInstallerKeyReport
+    # Best-effort from here on: a partial cleanup is preferable to an early abort, so
+    # errors are non-fatal. Note the consequence - try/catch no longer traps
+    # non-terminating errors, so anything that must be caught uses -ErrorAction Stop.
+    $ErrorActionPreference  = 'Continue'
+    $script:RemovalDeadline = $Deadline
 
-    # --- Download and validate BEFORE touching anything ---
-    # If the URL is unreachable, expired, or intercepted, the run aborts here with the
-    # machine completely untouched. An expired installer URL returns a small HTML error
-    # body that "downloads" successfully, which is exactly how a device ends up with no
-    # agent at all - hence the validation ladder in Test-InstallerFile.
-    Write-Log "Downloading the new agent installer from: $InstallerURL"
-    if (-not (Get-InstallerWithFallback -Url $InstallerURL -Destination $MsiPath)) {
-        Write-Log 'Every download method failed or produced an invalid installer. No changes have been made to this machine.' -Level Error
-        exit 1
-    }
-
-    if ($DryRun) {
-        Write-Log 'DryRun specified: the installer is valid and the machine has been surveyed. Nothing was removed or installed.' -Level Success
-        Write-Log "The validated installer has been left at: $MsiPath"
-        exit 0
-    }
-
-    # --- Register the install task before touching the agent ---
-    Remove-Item -LiteralPath $RemovalDoneFlag -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $InstallDoneFlag -Force -ErrorAction SilentlyContinue
-    Register-InstallTask -MsiPath $MsiPath -StateDir $StateDir -HelperPath $HelperPs1 `
-        -DelayMinutes $InstallDelayMinutes -MaxRemovalWaitMinutes $MaxRemovalWaitMinutes `
-        -RetryWindowHours $RetryWindowHours
-
-    # From here on the machine is being modified, and a partial cleanup is preferable to an
-    # early abort, so errors become non-fatal. Note the consequence: try/catch no longer
-    # traps non-terminating errors, so anything that must be caught below uses an explicit
-    # -ErrorAction Stop.
-    $ErrorActionPreference = 'Continue'
-
-    Write-Log '--- Beginning NinjaRMM agent removal ---'
+    # Normalise: $null.Count is not 0 on PowerShell 3.0, so the body's count test needs a
+    # real array even when nothing was passed.
+    $Entries = @($Entries | Where-Object { $_ })
 
     # --- Run the MSI uninstaller ---
     if ($entries.Count -eq 0) {
@@ -1289,6 +1278,8 @@ try {
             }
         }
     }
+
+    if (Test-RemovalExpired 'directory removal and everything after it') { return $false }
 
     # --- Remove directories ---
     # $env:ProgramData\NinjaRMMAgent holds tenant policy and config; leaving it risks the
@@ -1342,6 +1333,8 @@ try {
         Write-Log "Removing additional agent directory: $dir"
         Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
     }
+
+    if (Test-RemovalExpired 'registry cleanup and everything after it') { return $false }
 
     # --- Remove registry entries ---
     # Ninja leaves traces across several locations. All matching keys are collected first,
@@ -1404,6 +1397,8 @@ try {
         if (Test-Path $key) { Write-Log "Failed to remove registry key: $key" -Level Warning }
     }
 
+    if (Test-RemovalExpired 'Ninja Remote cleanup') { return $false }
+
     # --- Remove Ninja Remote ---
     Write-Log '--- Removing Ninja Remote ---'
     Remove-NRDisplayDriver
@@ -1453,31 +1448,359 @@ try {
         Remove-Item -LiteralPath $nrSpool -Recurse -Force -ErrorAction SilentlyContinue
     }
 
-    # --- Signal completion so the install task can proceed immediately ---
-    Write-Log 'Removal complete. Signalling the install task.' -Level Success
-    New-Item -ItemType File -Path $RemovalDoneFlag -Force | Out-Null
+    if ((Get-Date) -ge $Deadline) {
+        Write-Log 'The removal budget was exhausted before every stage finished. Continuing to the install.' -Level Warning
+        return $false
+    }
+    return $true
+}
 
-    # Nudge the task rather than waiting for its trigger, so a successful removal installs
-    # in seconds instead of minutes. Harmless if it fails - the trigger still fires.
-    try {
-        Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop
-        Write-Log 'Install task started.'
-    } catch {
-        Write-Log "Could not start the install task early; it will fire on its own trigger. ($($_.Exception.Message))" -Level Warning
+# Installs the new agent and verifies it, rather than trusting the msiexec exit code.
+# The verification is what turns a silent failure into a visible one.
+function Invoke-AgentInstall {
+    param (
+        [string]$MsiPath,
+        [string[]]$Properties
+    )
+
+    # AV and endpoint protection can quarantine or delete a downloaded installer AFTER the
+    # download reported success, so the file is re-checked immediately before it is used.
+    if (-not (Test-Path -LiteralPath $MsiPath)) {
+        Write-Log "The installer is missing from $MsiPath (deleted or quarantined?). Cannot install." -Level Error
+        return $false
+    }
+    $msiLen = (Get-Item -LiteralPath $MsiPath).Length
+    if ($msiLen -lt 1MB) {
+        Write-Log "The installer at $MsiPath is only $msiLen bytes. Refusing to run it." -Level Error
+        return $false
     }
 
-    Write-Log "Done. Track progress in $StateDir\install.log, and watch the new NinjaOne device timeline for the check-in." -Level Success
+    $msiexecLog = Join-Path $StateDir 'msi-install.log'
+    $msiArgs = @('/i', "`"$MsiPath`"", '/quiet', '/norestart', '/L*V', "`"$msiexecLog`"") + $Properties
+
+    # The token, if any, is redacted from the log - it is an enrollment credential.
+    $shown = ($msiArgs | ForEach-Object { $_ -replace '(TOKENID|CLIENTUID)=.*', '$1=<redacted>' }) -join ' '
+    Write-Log "Installing the agent from $MsiPath ($msiLen bytes)..."
+    Write-Log "msiexec $shown"
+
+    $proc = Start-Process 'msiexec.exe' -ArgumentList $msiArgs -Wait -NoNewWindow -PassThru
+    Write-Log "msiexec exited with code $($proc.ExitCode)."
+
+    $verifyDeadline = (Get-Date).AddMinutes(5)
+    while ((Get-Date) -lt $verifyDeadline) {
+        $svc = Get-Service 'NinjaRMMAgent' -ErrorAction SilentlyContinue
+        if ($svc) {
+            if ($svc.Status -ne 'Running') { try { Start-Service 'NinjaRMMAgent' -ErrorAction SilentlyContinue } catch { } }
+            $svc = Get-Service 'NinjaRMMAgent' -ErrorAction SilentlyContinue
+            Write-Log "The NinjaRMMAgent service is present (status: $($svc.Status)). The device should check in shortly." -Level Success
+            return $true
+        }
+        Start-Sleep -Seconds 10
+    }
+
+    Write-Log "The NinjaRMMAgent service did not appear after the install (msiexec exit $($proc.ExitCode)). See $msiexecLog." -Level Error
+    return $false
+}
+
+# ==============================================================================
+# MAIN
+# ==============================================================================
+
+Write-Log "=== Reinstall NinjaRMM Agent v$ScriptVersion - phase: $Phase ==="
+
+# --- Preflight (both phases) ---
+# Reported up front because these are the variables that determine which of the known
+# failure modes apply, and this log is what gets read when a machine goes quiet.
+$isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
+           ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+Write-Log "PowerShell : $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition))"
+Write-Log "OS         : $((Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).Caption)"
+Write-Log "Process    : $(if ([Environment]::Is64BitProcess) { '64-bit' } else { '32-bit' }) on $(if ([Environment]::Is64BitOperatingSystem) { '64-bit' } else { '32-bit' }) Windows"
+Write-Log "Identity   : $([Security.Principal.WindowsIdentity]::GetCurrent().Name) (elevated: $isAdmin)"
+Write-Log "State dir  : $StateDir"
+if ($script:StateDirAclError) {
+    Write-Log "Could not restrict the state directory ACL: $script:StateDirAclError" -Level Warning
+}
+
+if ($PSVersionTable.PSVersion.Major -lt 3) {
+    Write-Log "PowerShell $($PSVersionTable.PSVersion) is not supported - this script needs 3.0 or later for the ScheduledTasks cmdlets and ConvertTo-Json." -Level Error
+    exit 1
+}
+if (-not $isAdmin) {
+    Write-Log 'This script must run elevated (as SYSTEM or an administrator).' -Level Error
+    exit 1
+}
+
+# ==============================================================================
+# TRANSFER PHASE - the Scheduled Task's run. Everything destructive happens here.
+# ==============================================================================
+if ($Phase -eq 'Transfer') {
+
+    # Marks the transfer finished and takes the task out of the schedule. Only ever
+    # called once the install has been VERIFIED, so a task left registered always means
+    # a machine that still needs attention.
+    function Complete-Transfer {
+        param ([string]$Reason)
+        Write-Log $Reason -Level Success
+        New-Item -ItemType File -Path $InstallDoneFlag -Force | Out-Null
+        try {
+            Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop
+            Write-Log "Transfer task '$TaskName' unregistered."
+        } catch {
+            Write-Log "Could not unregister the task: $($_.Exception.Message)" -Level Warning
+        }
+    }
+
+    if (Test-Path -LiteralPath $InstallDoneFlag) {
+        Complete-Transfer 'The transfer already completed on an earlier run. Nothing to do.'
+        exit 0
+    }
+
+    $config = $null
+    try {
+        $config = Get-Content -LiteralPath $ConfigPath -Raw -ErrorAction Stop | ConvertFrom-Json
+    } catch {
+        Write-Log "Could not read the transfer config at $ConfigPath : $($_.Exception.Message)" -Level Error
+        Write-Log 'Without it the incumbent cannot be told apart from a newly installed agent, so removal is unsafe. Re-run the PREPARE phase from NinjaOne.' -Level Error
+        exit 1
+    }
+
+    # Filtering is not cosmetic. A genuinely empty list round-trips fine, but a config
+    # missing the property altogether - written by an older version, or hand-edited -
+    # yields $null, and @($null) has Count 1, not 0. That would silently defeat the
+    # "nothing recorded" branch below and hand Get-IncumbentEntries a $null code to
+    # match on. Verified on 5.1: absent property -> naive count 1, filtered count 0.
+    $recordedCodes    = @($config.IncumbentProductCodes | Where-Object { $_ })
+    $maxRemovalMins   = if ($config.MaxRemovalMinutes) { [int]$config.MaxRemovalMinutes } else { 20 }
+    $msiProperties    = @(Get-MsiInstallProperties -Token $config.InstallerToken -FedRampHost $config.HostURL)
+
+    Write-Log "Recorded incumbent product codes: $(if ($recordedCodes.Count) { $recordedCodes -join ', ' } else { '<none - the incumbent had no parseable uninstall entry>' })"
+
+    # --- Decide whether removal should run ---
+    # Three cases, in order:
+    #   1. A recorded incumbent product code is still registered -> remove it. This is
+    #      exact: it cannot match an agent installed by this script.
+    #   2. Nothing recorded and neither the removal nor the install has been attempted
+    #      -> run the cleanup once anyway, because a corrupt install can leave files,
+    #      services and registry keys with no uninstall entry at all.
+    #   3. Otherwise -> skip. In particular, once the install has been ATTEMPTED the
+    #      removal must never run again: if verification failed after msiexec actually
+    #      succeeded, a retry running removal would delete the new agent.
+    $incumbent = @(Get-IncumbentEntries -ProductCodes $recordedCodes)
+    $installAttempted = Test-Path -LiteralPath $InstallTriedFlag
+
+    $doRemoval = Test-RemovalRequired -IncumbentCount $incumbent.Count `
+        -RecordedCodeCount $recordedCodes.Count `
+        -RemovalDone (Test-Path -LiteralPath $RemovalDoneFlag) `
+        -InstallAttempted $installAttempted
+
+    if ($incumbent.Count -gt 0) {
+        foreach ($e in $incumbent) {
+            Write-Log "Incumbent still present: '$($e.DisplayName)' $($e.DisplayVersion) [$($e.View)] ProductCode=$($e.ProductCode)"
+        }
+    } elseif ($doRemoval) {
+        Write-Log 'No agent uninstall entry to work from. Running the file, service and registry cleanup once in case of a corrupt install.' -Level Warning
+    } elseif ($installAttempted) {
+        Write-Log 'The install has already been attempted, so removal is skipped - any agent present now could be the new one.'
+    } else {
+        Write-Log 'The incumbent agent is gone. Skipping removal.'
+    }
+
+    if ($doRemoval) {
+        $deadline = (Get-Date).AddMinutes($maxRemovalMins)
+        Write-Log "--- Removal phase (budget $maxRemovalMins minute(s), until $($deadline.ToString('HH:mm:ss'))) ---"
+        $installLocation = Get-NinjaInstallLocation
+        Write-Log "Install location: $(if ($installLocation) { $installLocation } else { '<not found>' })"
+
+        # Wrapped because the install matters more than the cleanup: a terminating error
+        # here must not stop this run from getting an agent back onto the machine.
+        try {
+            $complete = Invoke-AgentRemoval -Entries $incumbent -InstallLocation $installLocation -Deadline $deadline
+            if ($complete) { Write-Log 'Removal complete.' -Level Success }
+        } catch {
+            Write-Log "The removal phase threw and was abandoned: $($_.Exception.Message)" -Level Error
+            Write-Log 'Continuing to the install regardless.' -Level Warning
+        }
+        New-Item -ItemType File -Path $RemovalDoneFlag -Force | Out-Null
+
+        # $ErrorActionPreference was relaxed inside Invoke-AgentRemoval's scope only; the
+        # install below is a fail-fast operation again.
+        $ErrorActionPreference = 'Stop'
+    }
+
+    # --- Install ---
+    # The flag is written BEFORE msiexec runs, not after. It is what stops a later retry
+    # from running the removal again, and the dangerous window is precisely the one where
+    # msiexec succeeded but this process died before it could verify.
+    Write-Log '--- Install phase ---'
+    New-Item -ItemType File -Path $InstallTriedFlag -Force | Out-Null
+
+    $installed = $false
+    try {
+        $installed = Invoke-AgentInstall -MsiPath $MsiPath -Properties $msiProperties
+    } catch {
+        Write-Log "The install threw: $($_.Exception.Message)" -Level Error
+    }
+
+    if ($installed) {
+        Complete-Transfer 'SUCCESS: the new NinjaOne agent is installed and its service is present.'
+        Remove-Item -LiteralPath $MsiPath -Force -ErrorAction SilentlyContinue
+        exit 0
+    }
+
+    # Leave the task registered so its repetition trigger retries. Exiting non-zero also
+    # surfaces the failure in the task's Last Run Result.
+    Write-Log 'FAILURE: the agent is not installed. The task remains registered and will retry.' -Level Error
+    exit 1
+}
+
+# ==============================================================================
+# PREPARE PHASE - runs under NinjaOne. Nothing here touches the agent.
+# ==============================================================================
+
+# --- Resolve the installer URL, token and host ---
+if ($env:installerUrl)   { $InstallerURL   = $env:installerUrl }
+if (-not $InstallerURL -and $NewMSPInstallerURL) { $InstallerURL = $NewMSPInstallerURL }
+if ($env:token)          { $InstallerToken = $env:token }
+if (-not $InstallerToken -and $env:installerToken) { $InstallerToken = $env:installerToken }
+if ($env:hostUrl)        { $HostURL        = $env:hostUrl }
+
+# Trim rather than trust: a URL or token pasted into a Ninja script variable regularly
+# arrives with surrounding whitespace or quotes.
+$InstallerURL   = "$InstallerURL".Trim().Trim('"', "'")
+$InstallerToken = "$InstallerToken".Trim().Trim('"', "'")
+$HostURL        = "$HostURL".Trim().Trim('"', "'")
+
+if (-not $InstallerURL) {
+    Write-Log 'No installer URL provided. Set $NewMSPInstallerURL in the script, pass -InstallerURL, or configure the "installerUrl" Ninja script variable.' -Level Error
+    exit 1
+}
+if ($InstallerURL -notmatch '^https://') {
+    Write-Log "The installer URL must be HTTPS. Got: $InstallerURL" -Level Error
+    exit 1
+}
+if (-not (Test-InstallerConfig -Url $InstallerURL -Token $InstallerToken -FedRampHost $HostURL)) {
+    exit 1
+}
+if (-not (Get-Command Register-ScheduledTask -ErrorAction SilentlyContinue)) {
+    Write-Log 'The ScheduledTasks module is unavailable, so the transfer could not be made to survive the agent removal. Refusing to proceed - removing the agent now would leave this device unmanaged.' -Level Error
+    exit 1
+}
+
+try {
+    # --- Survey the incumbent agent ---
+    # Note there can legitimately be MORE THAN ONE agent uninstall entry, each with its
+    # own product code (observed on a real machine: two NinjaRMMAgent registrations).
+    # Every one of them must be uninstalled - leaving a stray MSI product record behind is
+    # the one documented cause of a subsequent agent install refusing to proceed.
+    $allNinja        = @(Get-NinjaUninstallEntries)
+    $entries         = @($allNinja | Where-Object { $_.IsAgent })
+    $otherProducts   = @($allNinja | Where-Object { -not $_.IsAgent })
+    $installLocation = Get-NinjaInstallLocation
+
+    if ($entries.Count -eq 0) {
+        Write-Log 'No NinjaOne agent was found in the registry. Treating this as a clean install.' -Level Warning
+    } else {
+        foreach ($e in $entries) {
+            $pc = if ($e.ProductCode) { $e.ProductCode } else { '<could not parse>' }
+            Write-Log "Found agent: '$($e.DisplayName)' $($e.DisplayVersion) [$($e.View)] ProductCode=$pc"
+        }
+        if ($entries.Count -gt 1) {
+            Write-Log "$($entries.Count) agent registrations are present; all of them will be uninstalled."
+        }
+    }
+
+    # Other Ninja-branded products are reported but deliberately left alone: they have
+    # their own product codes, do not block an agent install, and blindly removing
+    # anything matching 'Ninja' on an unfamiliar fleet risks collateral damage.
+    foreach ($o in $otherProducts) {
+        Write-Log "Other Ninja product found (NOT removed - review if the install fails): '$($o.DisplayName)' $($o.DisplayVersion) [$($o.View)]" -Level Warning
+    }
+
+    Write-Log "Install location: $(if ($installLocation) { $installLocation } else { '<not found>' })"
+
+    Write-OrphanedInstallerKeyReport
+
+    # --- Download and validate BEFORE touching anything ---
+    # If the URL is unreachable, expired, or intercepted, the run aborts here with the
+    # machine completely untouched. An expired installer URL returns a small HTML error
+    # body that "downloads" successfully, which is exactly how a device ends up with no
+    # agent at all - hence the validation ladder in Test-InstallerFile.
+    Write-Log "Downloading the new agent installer from: $InstallerURL"
+    if (-not (Get-InstallerWithFallback -Url $InstallerURL -Destination $MsiPath)) {
+        Write-Log 'Every download method failed or produced an invalid installer. No changes have been made to this machine.' -Level Error
+        exit 1
+    }
+
+    if ($DryRun) {
+        Write-Log 'DryRun specified: the installer is valid and the machine has been surveyed. Nothing was removed, installed, or scheduled.' -Level Success
+        Write-Log "The validated installer has been left at: $MsiPath"
+        exit 0
+    }
+
+    # --- Record what the transfer needs to know ---
+    # The product codes are the important part: they are what lets the TRANSFER phase tell
+    # the incumbent agent apart from one this script installed, which is what makes the
+    # task safe to retry.
+    $productCodes = @($entries | Where-Object { $_.ProductCode } | ForEach-Object { $_.ProductCode })
+    $config = [pscustomobject]@{
+        ScriptVersion          = $ScriptVersion
+        PreparedAt             = (Get-Date).ToString('o')
+        InstallerURL           = $InstallerURL
+        InstallerToken         = $InstallerToken
+        HostURL                = $HostURL
+        MaxRemovalMinutes      = $MaxRemovalMinutes
+        IncumbentProductCodes  = $productCodes
+        IncumbentInstallPath   = $installLocation
+    }
+    $config | ConvertTo-Json | Set-Content -LiteralPath $ConfigPath -Encoding UTF8 -Force
+
+    # Clear any flags from a previous transfer so this one starts from a known state.
+    foreach ($flag in @($RemovalDoneFlag, $InstallDoneFlag, $InstallTriedFlag)) {
+        Remove-Item -LiteralPath $flag -Force -ErrorAction SilentlyContinue
+    }
+
+    # --- Copy this script where the task can run it ---
+    # A copy, not the original: NinjaOne runs scripts from a temporary path it cleans up,
+    # and the state directory is the one place guaranteed to survive the teardown.
+    if (-not $PSCommandPath) {
+        Write-Log 'Cannot determine this script''s own path ($PSCommandPath is empty), so the transfer task has nothing to run. Run this as a .ps1 file rather than piped into PowerShell.' -Level Error
+        exit 1
+    }
+    if ($PSCommandPath -ne $SelfCopyPath) {
+        Copy-Item -LiteralPath $PSCommandPath -Destination $SelfCopyPath -Force
+    }
+    Write-Log "Transfer script staged at: $SelfCopyPath"
+
+    # --- Register and start the transfer task ---
+    Unregister-ScheduledTask -TaskName $LegacyTaskName -Confirm:$false -ErrorAction SilentlyContinue
+    Register-TransferTask -ScriptPath $SelfCopyPath -DelayMinutes $InstallDelayMinutes `
+        -RetryWindowHours $RetryWindowHours -MaxRemovalMinutes $MaxRemovalMinutes
+
+    # Start it now rather than waiting for the trigger. This is what gives the transfer
+    # upstream's immediacy - the work begins in seconds - while the trigger, the startup
+    # trigger and the repetition remain as the safety net upstream gave up.
+    try {
+        Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+        Write-Log 'Transfer task started.' -Level Success
+    } catch {
+        Write-Log "Could not start the transfer task immediately; it will fire on its own trigger in about $InstallDelayMinutes minute(s). ($($_.Exception.Message))" -Level Warning
+    }
+
+    Write-Log 'This device will go offline in the incumbent NinjaOne console shortly, then appear in the new one.' -Level Success
+    Write-Log "Track progress in $StateDir\transfer-task.log" -Level Success
     exit 0
 }
 catch {
     Write-Log "Fatal error: $($_.Exception.Message)" -Level Error
     Write-Log "At: $($_.InvocationInfo.PositionMessage)" -Level Error
-    # The install task, if it was registered, is left in place deliberately - it is what
-    # recovers this machine. Do not clean it up on the way out.
+    # Nothing destructive happens in this phase, so a failure here leaves the machine as
+    # it was found - with one exception worth reporting clearly.
     if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
-        Write-Log "The install task '$TaskName' is still registered and will attempt the install." -Level Warning
+        Write-Log "The transfer task '$TaskName' is registered and will attempt the transfer." -Level Warning
     } else {
-        Write-Log 'No install task is registered. This device may be left without an agent - investigate immediately.' -Level Error
+        Write-Log 'No transfer task is registered and the incumbent agent has NOT been touched. This device is unchanged.' -Level Warning
     }
     exit 1
 }
