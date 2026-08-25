@@ -11,9 +11,31 @@
     NinjaOne agents cannot install over an existing NinjaOne agent, so the incumbent
     must be removed first. Because removing the agent tears down the process tree that
     a NinjaOne script runs inside, the install cannot happen inline - it is handed to a
-    Scheduled Task that runs outside this script's process tree. This matches the
-    approach used by NinjaOne's own GPO deployment tooling and by the community
-    migration scripts (see .NOTES).
+    Scheduled Task that runs outside this script's process tree. NinjaOne's own GPO
+    deployment tooling uses the same pattern, gated on service absence.
+
+    WHY A SCHEDULED TASK, WHEN UPSTREAM REMOVED THEIRS:
+    The community script this one descends from (see .NOTES) dropped its scheduled task
+    on 2025-12-30 after several users reported the reinstall "working on some systems and
+    not on others" - the same symptom that prompted this rewrite. That was never
+    diagnosed upstream. The cause is almost certainly that both upstream task versions
+    called New-ScheduledTask with NO -Settings argument, inheriting the Task Scheduler
+    defaults: DisallowStartIfOnBatteries and StopIfGoingOnBatteries are True and
+    StartWhenAvailable is False. A desktop installs, a laptop on battery never does, and
+    a trigger missed while the device was asleep is dropped instead of run late. So the
+    task is kept here and every one of those settings is now set explicitly (see
+    Register-InstallTask) - it is the only design that survives a reboot and retries.
+
+    Upstream's replacement is to write the work to a .ps1, launch it with a detached
+    Start-Process (no -Wait), and exit immediately so no live process tree remains to be
+    killed. That is faster (removal starts in ~1 minute rather than 5) but has no retry
+    at all: if the child dies or the device reboots, nothing tries again.
+
+    KNOWN LIMITATION: the removal below still runs inline in this process, which is the
+    one the agent teardown can kill. If that happens partway through Uninstall-NinjaMSI,
+    the cleanup after it is skipped and the install task will take its "agent gone, no
+    signal" branch and install over a partially-cleaned machine. Moving the removal into
+    the task alongside the install would close this; it is a deliberate open item.
 
     Order of operations - the machine is never left without a path to an agent:
       1. Download and rigorously validate the MSI. Nothing is touched until this passes.
@@ -104,6 +126,12 @@
       https://www.ninjaone.com/docs/new-to-ninjaone/agent-installation/agent-uninstall-prevention/
     NinjaOne agent deployment via GPO scheduled task (gates on service absence)
       https://www.ninjaone.com/docs/new-to-ninjaone/agent-installation/gpo-scheduled-task/
+    NinjaOne Endpoint Management: Agent Removal Guide (portal login required)
+      https://ninjarmm.zendesk.com/hc/en-us/articles/115001836286
+    Reinstall or Migrate NinjaOne Agent - the origin of this script, by Mark Giordano
+    (NinjaOne). Dojo > Community > Community Scripting; portal login required. Its
+    comment thread is where the scheduled-task failures were reported and where the
+    older task-based versions can still be read.
 #>
 
 # NOTE: '#Requires -RunAsAdministrator' is deliberately NOT used. It is a PowerShell 4.0
@@ -126,7 +154,7 @@ param (
 $NewMSPInstallerURL = ''
 # ==============================================================================
 
-$ScriptVersion = '2.0.0'
+$ScriptVersion = '2.0.1'
 $TaskName      = 'NinjaRMM-NewAgentInstall'
 
 # Identifies the agent itself, as opposed to other Ninja-branded products that can share
@@ -722,6 +750,39 @@ function Get-NinjaInstallLocation {
     return $null
 }
 
+# Reports Windows Installer product keys that have no ProductName.
+#
+# A valid product key always has one. Keys missing it can indicate a corrupt or partial
+# Ninja install, and per NinjaOne's removal guide this is the one documented cause of a
+# subsequent agent install refusing to proceed. They are only ever REPORTED, never deleted:
+# other products can legitimately share this shape and damaging them would be worse than a
+# failed transfer. The excluded GUID is a known Windows common component that has no
+# ProductName by design.
+#
+# This runs during the SURVEY, before anything is modified. NinjaOne's own script performs
+# the same check but prints it as its very last action - which is the least likely line to
+# ever be reached, because tearing down the agent can kill the script's own process tree
+# partway through. Running it up front means the warning is in the log even if this run is
+# terminated at the uninstall. The result is the same either way: every key this deletes
+# later has a ProductName by definition, so removal cannot change the orphan set.
+function Write-OrphanedInstallerKeyReport {
+    try {
+        $orphans = New-Object System.Collections.ArrayList
+        Get-ChildItem 'HKLM:\Software\Classes\Installer\Products' -ErrorAction SilentlyContinue | ForEach-Object {
+            if ($_.PSChildName -match '99E80CA9B0328e74791254777B1F42AE') { return }
+            $props = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+            if (-not $props -or $null -eq $props.ProductName) { [void]$orphans.Add($_.PSChildName) }
+        }
+        if ($orphans.Count -gt 0) {
+            Write-Log 'Some installer registry keys have no ProductName - possibly a corrupt Ninja install entry.' -Level Warning
+            Write-Log 'If the new agent fails to install, back up and then review these keys:' -Level Warning
+            $orphans | ForEach-Object { Write-Log "  $_" -Level Warning }
+        }
+    } catch {
+        Write-Log "The orphaned key check failed (non-fatal): $($_.Exception.Message)" -Level Warning
+    }
+}
+
 # ==============================================================================
 # REMOVAL HELPERS
 # ==============================================================================
@@ -1160,6 +1221,8 @@ try {
 
     Write-Log "Install location: $(if ($installLocation) { $installLocation } else { '<not found>' })"
 
+    Write-OrphanedInstallerKeyReport
+
     # --- Download and validate BEFORE touching anything ---
     # If the URL is unreachable, expired, or intercepted, the run aborts here with the
     # machine completely untouched. An expired installer URL returns a small HTML error
@@ -1341,29 +1404,6 @@ try {
         if (Test-Path $key) { Write-Log "Failed to remove registry key: $key" -Level Warning }
     }
 
-    # --- Check for orphaned installer keys ---
-    # A valid Windows Installer product key always has a ProductName. Keys missing it can
-    # indicate a corrupt or partial Ninja install, and per NinjaOne's guide this is the one
-    # documented cause of a subsequent install refusing to proceed. They are only reported,
-    # never deleted blindly: other products can legitimately share this shape and damaging
-    # them would be worse than a failed transfer. The excluded GUID is a known Windows
-    # common component that has no ProductName by design.
-    try {
-        $orphans = New-Object System.Collections.ArrayList
-        Get-ChildItem 'HKLM:\Software\Classes\Installer\Products' -ErrorAction SilentlyContinue | ForEach-Object {
-            if ($_.PSChildName -match '99E80CA9B0328e74791254777B1F42AE') { return }
-            $props = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
-            if (-not $props -or $null -eq $props.ProductName) { [void]$orphans.Add($_.PSChildName) }
-        }
-        if ($orphans.Count -gt 0) {
-            Write-Log 'Some installer registry keys have no ProductName - possibly a corrupt Ninja install entry.' -Level Warning
-            Write-Log 'If the new agent fails to install, back up and then review these keys:' -Level Warning
-            $orphans | ForEach-Object { Write-Log "  $_" -Level Warning }
-        }
-    } catch {
-        Write-Log "The orphaned key check failed (non-fatal): $($_.Exception.Message)" -Level Warning
-    }
-
     # --- Remove Ninja Remote ---
     Write-Log '--- Removing Ninja Remote ---'
     Remove-NRDisplayDriver
@@ -1372,10 +1412,17 @@ try {
     $systemNRKey = 'Registry::HKEY_USERS\S-1-5-18\Software\NinjaRMM LLC'
     if (Test-Path $systemNRKey) { Remove-Item $systemNRKey -Recurse -Force -ErrorAction SilentlyContinue }
 
-    # Enumerate real user profiles (S-1-5-21-* excludes built-in accounts). Loaded hives are
-    # already in HKU; profiles that are not logged in need NTUSER.DAT mounted.
+    # Enumerate real user profiles, excluding the built-in service accounts (S-1-5-18/19/20).
+    # BOTH SID families are matched deliberately:
+    #   S-1-5-21-*  local accounts and on-premises AD accounts (incl. hybrid-joined devices)
+    #   S-1-12-1-*  Microsoft Entra ID accounts on an Entra-joined (cloud-only) device
+    # NinjaOne's own removal script matches only S-1-5-21-*, so on a cloud-only fleet it
+    # sweeps ZERO real user profiles and leaves every user's Ninja Remote autostart entry
+    # and settings key behind.
+    # Loaded hives are already in HKU; profiles that are not logged in need NTUSER.DAT mounted.
     $profiles = @(Get-CimInstance Win32_UserProfile -ErrorAction SilentlyContinue |
-        Where-Object { $_.SID -like 'S-1-5-21-*' })
+        Where-Object { $_.SID -like 'S-1-5-21-*' -or $_.SID -like 'S-1-12-1-*' })
+    Write-Log "$($profiles.Count) user profile(s) to clean."
 
     foreach ($userProfile in ($profiles | Where-Object { $_.Loaded })) {
         Write-Log "Cleaning Ninja Remote registry items for: $($userProfile.LocalPath)"
