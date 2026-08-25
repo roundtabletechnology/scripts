@@ -20,9 +20,10 @@
 
       PREPARE phase (this process, run by NinjaOne, non-destructive):
         1. Validate the installer URL and any token, and preflight the host.
-        2. Survey the incumbent agent and record its product codes.
-        3. Download and rigorously validate the MSI. Nothing is touched until this passes.
-        4. Copy this script and the config to a durable state directory.
+        2. Survey the incumbent agent.
+        3. Download and rigorously validate the MSI. Nothing is written until this passes.
+        4. Record the incumbent's product codes and copy this script to a durable
+           state directory.
         5. Register the transfer task, start it, and exit.
 
       TRANSFER phase (the Scheduled Task, as SYSTEM, survives the teardown):
@@ -137,17 +138,17 @@
       New MSP NinjaOne > Administration > Installer > Windows Agent > Generate Installer
     Be sure to select the correct customer organization before generating the URL.
 
-    --- PREFERRED ALTERNATIVE: ask the incumbent MSP to delete the device ---
-    Per NinjaOne's own Removal Guide, deleting a device from the NinjaOne console
-    triggers a silent uninstall that succeeds even when Uninstall Prevention is ON.
-    That is the supported path. This script is the fallback for when the incumbent
-    will not cooperate, the device is offline in their console, or the agent is corrupt.
-
     --- OPTION 3: Generic installer plus a token (many organizations, one automation) ---
     Add a second Script Variable named "token" (or "installerToken") and supply the
     organization's installer token with the generic installer URL. A per-organization
     URL is still preferred - it needs no secret and the target organization is evident
     from the URL - but the token path is supported for bulk transfers.
+
+    --- PREFERRED ALTERNATIVE: ask the incumbent MSP to delete the device ---
+    Per NinjaOne's own Removal Guide, deleting a device from the NinjaOne console
+    triggers a silent uninstall that succeeds even when Uninstall Prevention is ON.
+    That is the supported path. This script is the fallback for when the incumbent
+    will not cooperate, the device is offline in their console, or the agent is corrupt.
 
     --- WHY A SCHEDULED TASK, WHEN UPSTREAM REMOVED THEIRS ---
     The community script this one descends from (see REFERENCES) dropped its scheduled
@@ -167,6 +168,21 @@
     immediately gives the same detachment plus reboot survival and retry, which is why
     this script starts the task rather than spawning a child.
 
+    --- IMPORTANT: WHAT NINJAONE'S ACTIVITY LOG DOES AND DOES NOT TELL YOU ---
+    The PREPARE phase exits 0 as soon as it has registered and started the task, which is
+    BEFORE the agent is removed or the new one installed. So a green result in the
+    incumbent's NinjaOne console means only "the transfer was set up successfully" - it is
+    NOT evidence that the transfer worked. That is unavoidable: the agent that would have
+    reported the outcome is the one being removed.
+
+    Confirm a transfer two other ways instead:
+      1. The device appears and checks in in the NEW NinjaOne console. This is the real
+         success signal.
+      2. On the endpoint, C:\ProgramData\RTT\NinjaAgentTransfer\install.done exists
+         and the task 'NinjaRMM-AgentTransfer' is GONE. The task unregisters itself only
+         after verifying the NinjaRMMAgent service is present, so a task still registered
+         means a transfer still in progress, or still retrying.
+
     --- TROUBLESHOOTING A FAILED TRANSFER ---
     Everything is logged to a durable location that survives the agent removal:
       C:\ProgramData\RTT\NinjaAgentTransfer\transfer.log     (PREPARE, this process)
@@ -178,6 +194,14 @@
     deliberately NOT cleaned up on failure so a failed machine can be diagnosed later.
     The directory is ACLed to SYSTEM and Administrators because transfer.json can hold
     an installer token.
+
+    The flag files in that folder record how far the transfer got:
+      removal.done       the removal phase ran (to completion, or up to its deadline)
+      install.attempted   msiexec /i has been started at least once. While this exists the
+                          removal will NOT run again unless a recorded incumbent product
+                          code is still registered - that is what stops a retry from
+                          deleting a newly installed agent.
+      install.done       the install was verified; the task has unregistered itself
 
     To re-run just the destructive half by hand on a failed machine:
       & 'C:\ProgramData\RTT\NinjaAgentTransfer\Transfer-NinjaAgent.ps1' -Phase Transfer
