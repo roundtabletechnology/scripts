@@ -247,7 +247,7 @@ param (
 # CONFIGURATION - Paste the new MSP's NinjaOne agent installer URL here.
 # See .NOTES above for how to obtain the URL and Ninja script variable setup.
 # ==============================================================================
-$NewMSPInstallerURL = ''
+$NewMSPInstallerURL = '' # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<< Enter URL Here
 # ==============================================================================
 
 $ScriptVersion   = '3.0.0'
