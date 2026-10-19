@@ -4,6 +4,23 @@ All notable changes to this repository are documented here. Entries are grouped 
 
 ## 2026-10-19
 
+### Mac/Applications - Uninstall OneDrive (new script, not yet run on a real Mac)
+
+The macOS counterpart of the Windows script above, for the same client. **Tested in a Mac-shaped Linux sandbox with the macOS commands stubbed (33 checks), not yet on real hardware - first lab run is via NinjaOne.**
+
+- Stops every process running from `/Applications/OneDrive.app` (matched on executable path, so extensions and the updater are included and nothing else is), unloads and removes the OneDrive launch daemons and agents (only booting out ones that are actually loaded), deletes the app, forgets its pkg receipts, and removes per-user caches, logs and support files.
+- **Blocks a reinstalled standalone OneDrive from syncing** with Microsoft's documented machine-wide plist, `/Library/Preferences/com.microsoft.OneDrive.plist`: `DisablePersonalSync`, an `AllowTenantList` whose only entry is a tenant that cannot exist, and `KFMBlockOptIn`. Written through `defaults export`/`import` so cfprefsd stays coherent and other keys in the domain are kept. Any existing allow or block list is replaced, since a real tenant left in an allow list would keep syncing.
+- **User files are never deleted.** `~/Library/CloudStorage/OneDrive-*` is the user's synced data on a Mac, not a cache - the most widely used community uninstaller deletes it. Every delete here goes through an allowlist of OneDrive program locations that refuses CloudStorage, containers and anything else.
+- **Containers, Group Containers and the Keychain are deliberately left alone.** Sonoma and Sequoia protect them with an "access data from other apps" prompt that a root script can trigger in front of the signed-in user, and nothing in them runs once the app is gone.
+- **Folder Backup is all-or-nothing on a Mac.** The app is shared by every account, so it cannot be removed for some users and kept for others: if any user has Desktop or Documents moved into OneDrive, nothing is changed and the script exits 1. `--include-folder-backup-users` overrides.
+- Office for Mac installs without the `com.microsoft.office InstallOneDrive = false` profile are reported, since that key only works through MDM.
+
+**Still to confirm on a real Mac:**
+1. That Folder Backup is detectable as `~/Desktop`/`~/Documents` symlinks into OneDrive. Microsoft does not document the mechanism, and the data-safety check depends on it.
+2. That the RMM agent can delete the app under App Management.
+3. That `ps -o comm=` reports full executable paths.
+4. That the standalone app honors the `/Library/Preferences` plist for the block keys.
+
 ### Windows/Applications - Uninstall OneDrive (new script)
 
 Removes the OneDrive sync app from every profile on a machine and keeps it from coming back, for a client that wants OneDrive gone fleet-wide. Runs as SYSTEM from NinjaOne with no prompts, no Explorer restart and no reboot.
