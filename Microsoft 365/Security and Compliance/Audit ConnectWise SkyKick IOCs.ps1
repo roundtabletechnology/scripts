@@ -505,7 +505,17 @@ function Test-AuditLog {
     }
 
     $roleAdd   = '^Add (eligible )?member to role'
-    $credAdd   = 'Certificates and secrets management|Add service principal credentials|Update service principal'
+    $credAdd   = 'Certificates and secrets management|Add service principal credentials'
+    # "Update service principal/application" fires for many routine reasons; it only counts as a
+    # credential change when the modified properties say so
+    $credProps = 'KeyDescription|KeyCredentials|PasswordCredentials|FederatedIdentityCredentials'
+
+    # Microsoft's own services (e.g. SharePoint Online maintaining its helper apps) are not "an app" in the
+    # sense that matters here. Their audit entries often have no appId, so look them up by object ID.
+    $msSpIds = @{}
+    foreach ($sp in @($script:AllSps)) {
+        if ($sp.id -and $MicrosoftOwnerTenants -contains [string]$sp.appOwnerOrganizationId) { $msSpIds[$sp.id] = $true }
+    }
     $consent   = '^Consent to application|^Add app role assignment to service principal|^Add delegated permission grant|^Add OAuth2PermissionGrant'
     $appChange = '^Update application|^Add owner to (application|service principal)|^Add application|^Add service principal'
 
@@ -517,7 +527,11 @@ function Test-AuditLog {
         $byApp    = $app -and ($app.appId -or $app.servicePrincipalId)
         $actorId  = if ($byApp) { $app.appId } else { $null }
         $isIocApp = $actorId -and $IocApps.Contains($actorId)
-        $actor    = if ($byApp) { "app $($app.displayName) ($($app.appId))" } elseif ($user) { "user $($user.userPrincipalName) from $($user.ipAddress)" } else { 'unknown actor' }
+        $isMsApp  = $byApp -and -not $actorId -and (
+                        ($app.servicePrincipalId -and $msSpIds.ContainsKey($app.servicePrincipalId)) -or
+                        (-not $script:AllSps -and $app.displayName -match '^(Office 365|Microsoft|Windows Azure|Azure)'))
+        $actorRef = if ($app.appId) { $app.appId } else { "object $($app.servicePrincipalId)" }
+        $actor    = if ($byApp) { "app $($app.displayName) ($actorRef)" } elseif ($user) { "user $($user.userPrincipalName) from $($user.ipAddress)" } else { 'unknown actor' }
 
         $ua = ($e.additionalDetails | Where-Object { $_.key -eq 'User-Agent' } | Select-Object -First 1).value
         $iocUa = Test-IocUserAgent $ua
@@ -530,16 +544,20 @@ function Test-AuditLog {
         $roleProp = @($target.modifiedProperties) | Where-Object { $_.displayName -eq 'Role.DisplayName' } | Select-Object -First 1
         $roleName = if ($roleProp) { ([string]$roleProp.newValue).Trim('"') } else { '' }
 
+        $propNames = (@($target.modifiedProperties) | ForEach-Object { $_.displayName }) -join ' '
+        $isCred = $act -match $credAdd -or ($act -match '^Update (service principal|application)' -and $propNames -match $credProps)
+
         $sev = $null; $why = $null
         $self = $byApp -and $app.servicePrincipalId -and $target.id -eq $app.servicePrincipalId
         if ($isIocApp)                       { $sev = 'Critical'; $why = 'performed by a ConnectWise/SkyKick app on the Huntress list' + $(if ($self -and $act -match $roleAdd) { ' - it added ITSELF to the role' }) }
         elseif ($iocIp)                      { $sev = 'Critical'; $why = "performed from IOC IP $userIp" }
+        elseif ($isMsApp -and -not $iocUa)  { continue }   # routine Microsoft service activity
         elseif ($byApp -and $act -match $roleAdd) {
             $sev  = 'High'; $why = $(if ($self) { 'an app added ITSELF to a directory role' } else { 'an app assigned a directory role' })
         }
-        elseif ($byApp -and $act -match $credAdd) { $sev = 'High';   $why = 'an app added credentials to an app' }
+        elseif ($byApp -and $isCred)              { $sev = 'High';   $why = 'an app added credentials to an app' }
         elseif ($byApp -and $act -match $consent) { $sev = 'Review'; $why = 'an app granted permissions or consent' }
-        elseif ($act -match $credAdd)             { $sev = 'Review'; $why = 'credential change on an app; confirm a team member made it' }
+        elseif ($isCred)                          { $sev = 'Review'; $why = 'credential change on an app; confirm a team member made it' }
         elseif ($act -match $roleAdd -and $roleName -and $PrivilegedRoles.Values -contains $roleName) { $sev = 'Review'; $why = 'privileged role assigned' }
         elseif ($byApp -and $act -match $appChange) { $sev = 'Review'; $why = 'an app modified an application' }
 
@@ -550,7 +568,7 @@ function Test-AuditLog {
         }
         if (-not $sev) { continue }
 
-        if ($act -match $credAdd -and $target.id) {
+        if ($isCred -and $target.id) {
             $tag = if ($isIocApp) { "IOC app $actor" } elseif ($byApp) { "an app ($actor)" } else { $actor }
             $credentialActors[$target.id] = "'$($act.Trim())' $(Format-Utc $e.activityDateTime) by $tag"
         }
@@ -565,7 +583,7 @@ function Test-AuditLog {
             -WhereToLook "Entra admin center > Monitoring & health > Audit logs > Date: custom ($(Format-Utc $e.activityDateTime)), Activity: '$act', or filter Correlation ID $($e.correlationId)" `
             -PortalUrl (Get-AuditLogUrl) `
             -Action $(if ($act -match $roleAdd) { 'Remove the role assignment if not intended (see Directory roles findings).' }
-                      elseif ($act -match $credAdd) { 'Find the credential under the target app''s Certificates & secrets and delete it if not created by your team.' }
+                      elseif ($isCred) { 'Find the credential under the target app''s Certificates & secrets and delete it if not created by your team.' }
                       else { 'Confirm the change was expected. Revert in the target app if not.' })
     }
 
@@ -726,8 +744,10 @@ function Test-VendorPermissions {
             $role = @($res.appRoles) | Where-Object { $_.id -eq $g.appRoleId } | Select-Object -First 1
             "$($res.displayName): $(if ($role) { $role.value } else { $g.appRoleId })"
         }
+        $permList = @($perms | Sort-Object -Unique)
+        $riskList = @($permList | Where-Object { $HighRiskPermissions -contains (($_ -split ': ', 2)[-1]) })
         Add-Finding -Severity Info -Category 'Vendor app permissions' -Object "$($sp.displayName) ($($sp.appId))" `
-            -Detail "$(@($perms).Count) application permissions: $((@($perms) | Sort-Object -Unique) -join '; ')" `
+            -Detail "$($permList.Count) application permissions, $($riskList.Count) high-risk: $(($riskList | ForEach-Object { ($_ -split ': ', 2)[-1] }) -join ', '). Full list in Apps.csv." `
             -WhereToLook "Entra admin center > Enterprise apps > $($sp.displayName) > Security > Permissions" `
             -PortalUrl (Get-EnterpriseAppUrl $sp.id $sp.appId 'Permissions')
     }
@@ -766,7 +786,9 @@ function Get-AppInventory {
     $grants = (Get-GraphPaged 'https://graph.microsoft.com/v1.0/oauth2PermissionGrants?$top=999' -Activity 'Delegated permission grants').Rows
     foreach ($g in $grants) {
         if (-not $g.clientId) { continue }
-        $api = if ($byId.ContainsKey($g.resourceId)) { $byId[$g.resourceId].displayName } else { 'API' }
+        # Same API labels as the application permissions, so "Exchange Online" is not also "Office 365 Exchange Online"
+        $resSp = $byId[$g.resourceId]
+        $api = if ($resSp -and $PermissionResources.Contains([string]$resSp.appId)) { $PermissionResources[[string]$resSp.appId] } elseif ($resSp) { $resSp.displayName } else { 'API' }
         if ($g.consentType -eq 'AllPrincipals') {
             if (-not $adminScopes.ContainsKey($g.clientId)) { $adminScopes[$g.clientId] = [System.Collections.Generic.List[string]]::new() }
             foreach ($s in ([string]$g.scope -split '\s+' | Where-Object { $_ })) { $adminScopes[$g.clientId].Add("${api}: $s") }
