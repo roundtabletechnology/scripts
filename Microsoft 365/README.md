@@ -36,7 +36,7 @@ See [HOWTO.md](../HOWTO.md) for guidance on downloading and running scripts. See
 
 | Script | Description |
 |---|---|
-| [Audit ConnectWise SkyKick IOCs.ps1](Security%20and%20Compliance/Audit%20ConnectWise%20SkyKick%20IOCs.ps1) | Read-only audit of one or many tenants for the October 2026 ConnectWise Cloud Backup (SkyKick) credential compromise reported by Huntress; reports where to find and disable each finding |
+| [Audit ConnectWise SkyKick IOCs.ps1](Security%20and%20Compliance/Audit%20ConnectWise%20SkyKick%20IOCs.ps1) | Read-only audit of one or many tenants for the October 2026 ConnectWise Cloud Backup (SkyKick) credential compromise reported by Huntress; reports where to find and disable each finding, plus an inventory of all third-party apps with risky permissions and unused apps flagged |
 | [Configure Defendify Phishing Simulation.ps1](Security%20and%20Compliance/Configure%20Defendify%20Phishing%20Simulation.ps1) | Whitelists Defendify phishing simulation infrastructure in Microsoft 365 |
 | [Configure Phinsec Phishing Simulation.ps1](Security%20and%20Compliance/Configure%20Phinsec%20Phishing%20Simulation.ps1) | Whitelists Phinsec phishing simulation infrastructure in Microsoft 365 |
 | [Get MFA Status Report.ps1](Security%20and%20Compliance/Get%20MFA%20Status%20Report.ps1) | Reports MFA enrollment status for all users in the tenant |

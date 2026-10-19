@@ -27,6 +27,12 @@
       5. Sign-in logs: service principal sign-ins to the ConnectWise apps, and
          any user or app sign-in from the IOC IP addresses.
       6. Conditional Access policies that exclude the ConnectWise apps.
+      7. Inventory of every third-party enterprise app (not published by
+         Microsoft): publisher, enabled state, application and admin-consented
+         delegated permissions, user consents and last sign-in, with high-risk
+         permissions and apps unused for 90+ days flagged. This is for spotting
+         other apps you may want to remove; it goes to Apps.csv and its own
+         section of the HTML report, separate from the IOC findings.
 
     Every finding includes the portal path and a direct link (opened in the
     right tenant) so you can review, disable or delete it yourself in the UI.
@@ -45,7 +51,7 @@
       - PIM-eligible role checks need Entra ID P2.
 
     Permissions: the signed-in account needs Global Reader (or Security Reader
-    plus Reports Reader) or GLobal Administrator in each customer tenant. The
+    plus Reports Reader) or Global Administrator in each customer tenant. The
     Microsoft Graph Command Line Tools app must be consented in the customer
     tenant, or pass -ClientId for your own multi-tenant app.
 
@@ -167,6 +173,30 @@ $PrivilegedRoles = @{
     '9360feb5-f418-4baa-8175-e2a00bac4301' = 'Directory Writers'
 }
 
+# App inventory: tenants that publish Microsoft's own apps (excluded from the third-party list)
+$MicrosoftOwnerTenants = @('f8cdef31-a31e-4b4a-93e4-5f571e91255a', '72f988bf-86f1-41af-91ab-2d7cd011db47')
+
+# Resource APIs whose application permissions are listed per app
+$PermissionResources = [ordered]@{
+    '00000003-0000-0000-c000-000000000000' = 'Microsoft Graph'
+    '00000002-0000-0ff1-ce00-000000000000' = 'Exchange Online'
+    '00000003-0000-0ff1-ce00-000000000000' = 'SharePoint'
+    '00000002-0000-0000-c000-000000000000' = 'Azure AD Graph (legacy)'
+    '00000007-0000-0ff1-ce00-000000000000' = 'Exchange Online Protection'
+}
+
+# Application or admin-consented delegated permissions that give broad data or directory access
+$HighRiskPermissions = @(
+    'Mail.Read', 'Mail.ReadWrite', 'Mail.Send', 'MailboxSettings.ReadWrite', 'full_access_as_app', 'full_access_as_user',
+    'EWS.AccessAsUser.All', 'Exchange.ManageAsApp', 'Calendars.ReadWrite', 'Contacts.ReadWrite',
+    'Files.Read.All', 'Files.ReadWrite.All', 'Sites.Read.All', 'Sites.ReadWrite.All', 'Sites.Manage.All', 'Sites.FullControl.All',
+    'Chat.Read.All', 'Chat.ReadWrite.All', 'ChannelMessage.Read.All',
+    'Directory.ReadWrite.All', 'Directory.AccessAsUser.All', 'User.ReadWrite.All', 'Group.ReadWrite.All', 'GroupMember.ReadWrite.All',
+    'Application.ReadWrite.All', 'Application.ReadWrite.OwnedBy', 'AppRoleAssignment.ReadWrite.All', 'DelegatedPermissionGrant.ReadWrite.All',
+    'RoleManagement.ReadWrite.Directory', 'UserAuthenticationMethod.ReadWrite.All', 'Policy.ReadWrite.ConditionalAccess',
+    'Policy.ReadWrite.AuthenticationMethod', 'Domain.ReadWrite.All', 'Organization.ReadWrite.All', 'ServicePrincipalEndpoint.ReadWrite.All'
+)
+
 #endregion
 
 $Scopes = @(
@@ -252,6 +282,7 @@ function Get-SignInLogUrl { "$(Get-PortalBase)/Microsoft_AAD_IAM/ActiveDirectory
 #region Findings
 
 $Findings = [System.Collections.Generic.List[object]]::new()
+$AppInventory = [System.Collections.Generic.List[object]]::new()
 $SeverityOrder = @{ Critical = 0; High = 1; Review = 2; Info = 3 }
 
 function Add-Finding {
@@ -289,7 +320,8 @@ function Test-VendorApps {
     # Filtered here rather than in Graph: Graph rejects $filter on appOwnerOrganizationId (Request_UnsupportedQuery).
     # Matches the listed app IDs, anything else the vendor tenant publishes, and the names
     # older tenants show ("SkyKick Cloud Manager").
-    $all = (Get-GraphPaged 'https://graph.microsoft.com/v1.0/servicePrincipals?$select=id,appId,displayName,accountEnabled,appOwnerOrganizationId&$top=999' -Activity 'Enterprise apps').Rows
+    $all = (Get-GraphPaged 'https://graph.microsoft.com/v1.0/servicePrincipals?$select=id,appId,displayName,accountEnabled,appOwnerOrganizationId,servicePrincipalType,publisherName,verifiedPublisher,appRoles&$top=999' -Activity 'Enterprise apps').Rows
+    $script:AllSps = $all   # reused by the app inventory
     foreach ($sp in $all) {
         if (-not $sp.id) { continue }
         if (($sp.appId -and $IocApps.Contains([string]$sp.appId)) -or
@@ -679,6 +711,118 @@ function Test-VendorPermissions {
     }
 }
 
+function Get-AppInventory {
+    # Every third-party enterprise app, for spotting others worth removing. Read-only like everything else.
+    param([hashtable]$VendorSps)
+
+    $all = $script:AllSps
+    if (-not $all) {
+        $all = (Get-GraphPaged 'https://graph.microsoft.com/v1.0/servicePrincipals?$select=id,appId,displayName,accountEnabled,appOwnerOrganizationId,servicePrincipalType,publisherName,verifiedPublisher,appRoles&$top=999' -Activity 'Enterprise apps').Rows
+    }
+    $byId = @{}
+    foreach ($sp in $all) { if ($sp.id) { $byId[$sp.id] = $sp } }
+
+    # Application permissions: one call per resource API instead of one per app. These five
+    # cover what matters for data access; anything else shows as "other APIs" by count.
+    $appPerms = @{}   # client SP id -> list of "API: permission"
+    foreach ($resAppId in $PermissionResources.Keys) {
+        $res = $all | Where-Object { $_.appId -eq $resAppId } | Select-Object -First 1
+        if (-not $res) { continue }
+        $roles = @{}
+        foreach ($r in @($res.appRoles)) { if ($r.id) { $roles[[string]$r.id] = $r.value } }
+        $assigned = (Get-GraphPaged "https://graph.microsoft.com/v1.0/servicePrincipals/$($res.id)/appRoleAssignedTo?`$top=999" -Activity "$($PermissionResources[$resAppId]) app permissions").Rows
+        foreach ($a in $assigned) {
+            if ($a.principalType -ne 'ServicePrincipal' -or -not $a.principalId) { continue }
+            $name = if ($roles.ContainsKey([string]$a.appRoleId)) { $roles[[string]$a.appRoleId] } else { 'default access' }
+            if (-not $appPerms.ContainsKey($a.principalId)) { $appPerms[$a.principalId] = [System.Collections.Generic.List[string]]::new() }
+            $appPerms[$a.principalId].Add("$($PermissionResources[$resAppId]): $name")
+        }
+    }
+
+    # Delegated permissions: admin consent (AllPrincipals) scopes, and how many users consented themselves
+    $adminScopes = @{}; $userConsents = @{}; $userScopes = @{}
+    $grants = (Get-GraphPaged 'https://graph.microsoft.com/v1.0/oauth2PermissionGrants?$top=999' -Activity 'Delegated permission grants').Rows
+    foreach ($g in $grants) {
+        if (-not $g.clientId) { continue }
+        $api = if ($byId.ContainsKey($g.resourceId)) { $byId[$g.resourceId].displayName } else { 'API' }
+        if ($g.consentType -eq 'AllPrincipals') {
+            if (-not $adminScopes.ContainsKey($g.clientId)) { $adminScopes[$g.clientId] = [System.Collections.Generic.List[string]]::new() }
+            foreach ($s in ([string]$g.scope -split '\s+' | Where-Object { $_ })) { $adminScopes[$g.clientId].Add("${api}: $s") }
+        } else {
+            $userConsents[$g.clientId] = 1 + [int]$userConsents[$g.clientId]
+            # Risky scopes users granted themselves are the classic consent-phishing pattern
+            if (-not $userScopes.ContainsKey($g.clientId)) { $userScopes[$g.clientId] = [System.Collections.Generic.List[string]]::new() }
+            foreach ($s in ([string]$g.scope -split '\s+' | Where-Object { $_ })) { $userScopes[$g.clientId].Add("${api}: $s") }
+        }
+    }
+
+    # Last sign-in per app (needs Entra ID P1; beta only)
+    $lastSignIn = @{}; $signInNote = $null
+    try {
+        $acts = (Get-GraphPaged 'https://graph.microsoft.com/beta/reports/servicePrincipalSignInActivities?$top=999' -Activity 'App sign-in activity').Rows
+        foreach ($a in $acts) { if ($a.appId -and $a.lastSignInActivity.lastSignInDateTime) { $lastSignIn[[string]$a.appId] = ConvertTo-UtcDate $a.lastSignInActivity.lastSignInDateTime } }
+    } catch {
+        $signInNote = 'unknown (needs Entra ID P1)'
+    }
+
+    $staleBefore = [datetime]::UtcNow.AddDays(-90)
+    $count = 0
+    foreach ($sp in $all) {
+        if ($sp.servicePrincipalType -ne 'Application') { continue }   # skips managed identities and legacy entries
+        if (-not $sp.appOwnerOrganizationId -or $MicrosoftOwnerTenants -contains [string]$sp.appOwnerOrganizationId) { continue }
+
+        $perms    = if ($appPerms.ContainsKey($sp.id)) { @($appPerms[$sp.id] | Sort-Object -Unique) } else { @() }
+        $scopes   = if ($adminScopes.ContainsKey($sp.id)) { @($adminScopes[$sp.id] | Sort-Object -Unique) } else { @() }
+        $uScopes  = if ($userScopes.ContainsKey($sp.id)) { @($userScopes[$sp.id] | Sort-Object -Unique) } else { @() }
+        $isRisky  = { $HighRiskPermissions -contains (($_ -split ': ', 2)[-1]) }
+        $risky    = @(@(@($perms) + @($scopes) | Where-Object $isRisky) + @($uScopes | Where-Object $isRisky | ForEach-Object { "$_ (user consent)" }) | Sort-Object -Unique)
+        $isVendor = $VendorSps.ContainsKey($sp.id)
+        $owner    = if ($sp.appOwnerOrganizationId -eq $script:Tenant.Id) { 'This tenant (custom app)' } elseif ($sp.appOwnerOrganizationId -eq $VendorOwnerTenantId) { 'ConnectWise' } else { [string]$sp.appOwnerOrganizationId }
+        $verified = if ($sp.verifiedPublisher.displayName) { $sp.verifiedPublisher.displayName } else { '' }
+
+        $last = $null; $lastText = $signInNote
+        if (-not $signInNote) {
+            $last = $lastSignIn[[string]$sp.appId]
+            $lastText = if ($last) { Format-Utc $last } else { 'No sign-in recorded' }
+        }
+        $stale = -not $signInNote -and (-not $last -or $last -lt $staleBefore)
+
+        $flags = @()
+        if ($isVendor)             { $flags += 'ConnectWise/SkyKick (see IOC findings)' }
+        if ($risky.Count)          { $flags += 'High-risk permissions' }
+        if ($stale)                { $flags += 'Unused 90+ days' }
+        if (-not $verified -and $owner -ne 'This tenant (custom app)') { $flags += 'Unverified publisher' }
+
+        $count++
+        $AppInventory.Add([pscustomobject]@{
+            Tenant               = $script:Tenant.Name
+            TenantId             = $script:Tenant.Id
+            App                  = $sp.displayName
+            AppId                = $sp.appId
+            Flags                = $flags -join '; '
+            Enabled              = [bool]$sp.accountEnabled
+            Publisher            = $(if ($sp.publisherName) { $sp.publisherName } else { '' })
+            VerifiedPublisher    = $verified
+            OwnerTenant          = $owner
+            LastSignIn           = $lastText
+            HighRiskPermissions  = $risky -join '; '
+            AppPermissions       = $perms -join '; '
+            AdminDelegatedScopes = $scopes -join '; '
+            UserConsents         = [int]$userConsents[$sp.id]
+            PortalUrl            = Get-EnterpriseAppUrl $sp.id $sp.appId 'Properties'
+            ToRemove             = 'Enterprise apps > app > Properties: set Enabled for users to sign-in to No to test, then Delete. Turn off user consent (Enterprise apps > Consent and permissions) so users cannot add it back.'
+        })
+    }
+
+    $mine  = @($AppInventory | Where-Object TenantId -eq $script:Tenant.Id)
+    $riskN = @($mine | Where-Object HighRiskPermissions).Count
+    $staleN = @($mine | Where-Object { $_.Flags -like '*Unused 90+ days*' }).Count
+    Add-Finding -Severity Info -Category 'App inventory' -Object "$count third-party enterprise apps" `
+        -Detail "$riskN with high-risk permissions, $(if ($signInNote) { 'last sign-in unknown (needs Entra ID P1)' } else { "$staleN unused for 90+ days" }). Full list in Apps.csv and the app inventory section of the HTML report." `
+        -WhereToLook 'Entra admin center > Enterprise apps > All applications (Application type: Enterprise Applications)' `
+        -PortalUrl "$(Get-PortalBase)/Microsoft_AAD_IAM/StartboardApplicationsMenuBlade/~/AppAppsPreview"
+}
+
 #endregion
 
 function Invoke-Check {
@@ -709,8 +853,8 @@ function Write-ConsoleReport {
 }
 
 function Export-HtmlReport {
-    param($Items, [string]$Path)
-    $enc = { param($s) [System.Net.WebUtility]::HtmlEncode([string]$s) }
+    param($Items, $Apps, [string]$Path)
+    $enc ={ param($s) [System.Net.WebUtility]::HtmlEncode([string]$s) }
     $sb = [System.Text.StringBuilder]::new()
     [void]$sb.Append(@"
 <!doctype html><html><head><meta charset="utf-8"><title>ConnectWise SkyKick IOC Audit</title>
@@ -735,6 +879,23 @@ Source: <a href="https://www.huntress.com/blog/vendor-credential-enables-unautho
             [void]$sb.Append("<tr class='$($f.Severity)'><td class='sev'>$($f.Severity)</td><td>$(& $enc $f.Category)</td><td>$(& $enc $f.Object)</td><td>$(& $enc $f.Detail)</td><td>$where</td><td>$(& $enc $f.Action)</td></tr>")
         }
         [void]$sb.Append('</table>')
+
+        $tApps = @($Apps | Where-Object TenantId -eq $t.Name)
+        if ($tApps) {
+            [void]$sb.Append("<h3>Third-party app inventory ($($tApps.Count))</h3><p class='small'>Not IOC findings: every non-Microsoft enterprise app, for spotting others to remove. To remove one: open it, set <i>Enabled for users to sign-in?</i> to No to test, then Delete. Turn off user consent (Enterprise apps &gt; Consent and permissions) so users cannot add it back. Do not delete ConnectWise apps; disable them.</p>")
+            [void]$sb.Append('<table><tr><th>App</th><th>Flags</th><th>Enabled</th><th>Publisher</th><th>Last sign-in</th><th>High-risk permissions</th><th>All permissions</th><th>User consents</th></tr>')
+            foreach ($a in $tApps) {
+                $cls  = if ($a.HighRiskPermissions) { 'Review' } else { '' }
+                $pub  = if ($a.VerifiedPublisher) { "$(& $enc $a.VerifiedPublisher) (verified)" } elseif ($a.Publisher) { "$(& $enc $a.Publisher) (unverified)" } else { 'unknown' }
+                $pub += "<br><span class='small'>$(& $enc $a.OwnerTenant)</span>"
+                $permsAll = @()
+                if ($a.AppPermissions)       { $permsAll += "<i>Application:</i> $(& $enc $a.AppPermissions)" }
+                if ($a.AdminDelegatedScopes) { $permsAll += "<i>Delegated (admin consent):</i> $(& $enc $a.AdminDelegatedScopes)" }
+                $permsAll = $permsAll -join '<br>'
+                [void]$sb.Append("<tr class='$cls'><td><a href='$(& $enc $a.PortalUrl)' target='_blank'>$(& $enc $a.App)</a><br><span class='small'>$(& $enc $a.AppId)</span></td><td>$(& $enc $a.Flags)</td><td>$(if ($a.Enabled) { 'Yes' } else { 'No' })</td><td>$pub</td><td>$(& $enc $a.LastSignIn)</td><td>$(& $enc $a.HighRiskPermissions)</td><td class='small'>$permsAll</td><td>$($a.UserConsents)</td></tr>")
+            }
+            [void]$sb.Append('</table>')
+        }
     }
     [void]$sb.Append('</body></html>')
     [IO.File]::WriteAllText($Path, $sb.ToString(), [Text.UTF8Encoding]::new($false))
@@ -793,7 +954,8 @@ try {
     if (-not (Test-Path -LiteralPath $OutputPath)) { New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null }
     $csv  = Join-Path $OutputPath 'Findings.csv'
     $html = Join-Path $OutputPath 'Report.html'
-    if (Test-Path -LiteralPath $csv) { Remove-Item -LiteralPath $csv }   # per-tenant saves append
+    $appsCsv = Join-Path $OutputPath 'Apps.csv'
+    foreach ($f in $csv, $appsCsv) { if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f } }   # per-tenant saves append
 
     $i = 0
     foreach ($t in $tenants) {
@@ -825,6 +987,7 @@ try {
 
         # Each check is independent so one missing permission or license does not stop the rest.
         # The audit log runs before the credential check so new secrets can be tied to who added them.
+        $script:AllSps = $null
         $vendorSps  = Invoke-Check 'ConnectWise / SkyKick apps' { Test-VendorApps }
         if ($vendorSps -isnot [hashtable]) { $vendorSps = @{} }
         Invoke-Check 'Directory roles' { Test-RoleAssignments -VendorSps $vendorSps } | Out-Null
@@ -834,6 +997,7 @@ try {
         Invoke-Check 'Sign-in logs' { Test-SignIns } | Out-Null
         Invoke-Check 'Conditional Access' { Test-ConditionalAccess -VendorSps $vendorSps } | Out-Null
         Invoke-Check 'Vendor app permissions' { Test-VendorPermissions -VendorSps $vendorSps } | Out-Null
+        Invoke-Check 'Third-party app inventory' { Get-AppInventory -VendorSps $vendorSps } | Out-Null
 
         $tenantFindings = $Findings | Where-Object TenantId -eq $script:Tenant.Id
         Write-Host ''
@@ -843,9 +1007,22 @@ try {
         Write-Host ("Summary for {0}: {1}" -f $script:Tenant.Name, (($s | Sort-Object { $SeverityOrder[$_.Name] } | ForEach-Object { "$($_.Count) $($_.Name)" }) -join ', ')) -ForegroundColor White
 
         # Saved per tenant so stopping a long multi-tenant run keeps what is already done
+        $tenantApps = @($AppInventory | Where-Object TenantId -eq $script:Tenant.Id | Sort-Object { -not $_.HighRiskPermissions }, App)
+        $riskyApps  = @($tenantApps | Where-Object HighRiskPermissions)
+        if ($riskyApps) {
+            Write-Host ''
+            Write-Host "Third-party apps with high-risk permissions (full inventory in Apps.csv):" -ForegroundColor White
+            foreach ($a in $riskyApps) {
+                Write-Host ("  {0} [{1}] - {2}" -f $a.App, $(if ($a.Enabled) { 'enabled' } else { 'disabled' }), $a.HighRiskPermissions) -ForegroundColor Cyan
+                Write-Host ("    Last sign-in: {0}. Publisher: {1}. {2}" -f $a.LastSignIn, $(if ($a.VerifiedPublisher) { "$($a.VerifiedPublisher) (verified)" } elseif ($a.Publisher) { "$($a.Publisher) (unverified)" } else { 'unknown' }), $a.PortalUrl) -ForegroundColor Gray
+            }
+        }
+
+        # Saved per tenant so stopping a long multi-tenant run keeps what is already done
         $tenantFindings | Sort-Object { $SeverityOrder[$_.Severity] }, Category, When |
             Export-Csv -LiteralPath $csv -NoTypeInformation -Encoding UTF8 -Append
-        Write-Host "Saved to $csv" -ForegroundColor DarkGray
+        if ($tenantApps) { $tenantApps | Export-Csv -LiteralPath $appsCsv -NoTypeInformation -Encoding UTF8 -Append }
+        Write-Host "Saved to $OutputPath" -ForegroundColor DarkGray
     }
 
     Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
@@ -853,7 +1030,9 @@ try {
     # Rewrite the CSV sorted across all tenants, and build the HTML
     $sorted = $Findings | Sort-Object Tenant, { $SeverityOrder[$_.Severity] }, Category, When
     $sorted | Export-Csv -LiteralPath $csv -NoTypeInformation -Encoding UTF8
-    Export-HtmlReport -Items $sorted -Path $html
+    $sortedApps = $AppInventory | Sort-Object Tenant, { -not $_.HighRiskPermissions }, App
+    if ($sortedApps) { $sortedApps | Export-Csv -LiteralPath $appsCsv -NoTypeInformation -Encoding UTF8 }
+    Export-HtmlReport -Items $sorted -Apps $sortedApps -Path $html
 
     Write-Host ''
     Write-Host ("=" * 78) -ForegroundColor DarkGray
@@ -867,8 +1046,9 @@ try {
         }
     } else { Write-Host '  None' -ForegroundColor Green }
     Write-Host ''
-    Write-Host "CSV:  $csv"
-    Write-Host "HTML: $html"
+    Write-Host "Findings: $csv"
+    if ($sortedApps) { Write-Host "Apps:     $appsCsv" }
+    Write-Host "Report:   $html"
     exit 0
 } catch {
     Write-Error "Audit failed: $(Get-ErrorText $_)"
