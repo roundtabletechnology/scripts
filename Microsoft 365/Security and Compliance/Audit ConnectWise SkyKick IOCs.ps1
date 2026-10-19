@@ -45,7 +45,7 @@
       - PIM-eligible role checks need Entra ID P2.
 
     Permissions: the signed-in account needs Global Reader (or Security Reader
-    plus Reports Reader) in each customer tenant, e.g. through GDAP. The
+    plus Reports Reader) or GLobal Administrator in each customer tenant. The
     Microsoft Graph Command Line Tools app must be consented in the customer
     tenant, or pass -ClientId for your own multi-tenant app.
 
@@ -69,7 +69,9 @@
 
 .PARAMETER MaxSignInPages
     Cap on pages (up to 500 rows each) read per sign-in query. The backup app
-    can sign in thousands of times a week in a tenant that uses it. Default 40.
+    can sign in thousands of times a week in a tenant that uses it, and each page
+    takes several seconds. Default 10. Queries for the IOC IPs return only matching
+    rows, so a low cap rarely limits them.
 
 .PARAMETER ClientId
     Optional app ID to sign in with instead of Microsoft Graph Command Line Tools.
@@ -91,7 +93,7 @@
 
 .NOTES
     Name:    Audit ConnectWise SkyKick IOCs
-    Author:  RTT Support
+    Author:  Brad Brown, Systems Administrator
     Context: Technician workstation (interactive), PowerShell 5.1 or 7+
     Module:  Microsoft.Graph.Authentication (installed if missing)
 #>
@@ -112,7 +114,7 @@ param(
     [string]$OutputPath = "C:\temp\ConnectWise IOC Audit $(Get-Date -Format 'yyyy-MM-dd HHmm')",
 
     [ValidateRange(1, 500)]
-    [int]$MaxSignInPages = 40,
+    [int]$MaxSignInPages = 10,
 
     [string]$ClientId,
 
@@ -179,20 +181,23 @@ $Scopes = @(
 
 function Get-GraphPaged {
     # Follows @odata.nextLink. -MaxPages 0 = unlimited. Returns the rows and whether the cap cut it short.
-    param([string]$Uri, [int]$MaxPages = 0)
+    # -Activity prints a live page counter, since sign-in and audit queries can take minutes.
+    param([string]$Uri, [int]$MaxPages = 0, [string]$Activity)
     $rows  = [System.Collections.Generic.List[object]]::new()
     $page  = 0
     $next  = $Uri
+    $truncated = $false
+    $cap = if ($MaxPages -gt 0) { "/$MaxPages" } else { '' }
     while ($next) {
+        if ($Activity) { Write-Host ("`r    {0}: page {1}{2}, {3} rows so far   " -f $Activity, ($page + 1), $cap, $rows.Count) -NoNewline -ForegroundColor DarkGray }
         $resp = Invoke-MgGraphRequest -Method GET -Uri $next -OutputType Hashtable
         if ($resp.value) { foreach ($r in $resp.value) { $rows.Add($r) } }
         $next = $resp.'@odata.nextLink'
         $page++
-        if ($MaxPages -gt 0 -and $page -ge $MaxPages -and $next) {
-            return [pscustomobject]@{ Rows = $rows; Truncated = $true }
-        }
+        if ($MaxPages -gt 0 -and $page -ge $MaxPages -and $next) { $truncated = $true; break }
     }
-    [pscustomobject]@{ Rows = $rows; Truncated = $false }
+    if ($Activity) { Write-Host ("`r    {0}: {1} rows{2}          " -f $Activity, $rows.Count, $(if ($truncated) { " (stopped at $MaxPages pages)" })) -ForegroundColor DarkGray }
+    [pscustomobject]@{ Rows = $rows; Truncated = $truncated }
 }
 
 function ConvertTo-UtcDate {
@@ -281,16 +286,15 @@ function Add-Finding {
 function Test-VendorApps {
     # Returns the vendor service principals found so later checks can use them
     $found = @{}
-    foreach ($appId in $IocApps.Keys) {
-        $r = Get-GraphPaged "https://graph.microsoft.com/v1.0/servicePrincipals?`$filter=appId eq '$appId'&`$select=id,appId,displayName,accountEnabled,appOwnerOrganizationId"
-        foreach ($sp in $r.Rows) { if ($sp.id) { $found[$sp.id] = $sp } }
-    }
-    # Same vendor, apps Huntress did not list (older tenants show "SkyKick Cloud Manager")
-    $r = Get-GraphPaged "https://graph.microsoft.com/v1.0/servicePrincipals?`$filter=appOwnerOrganizationId eq $VendorOwnerTenantId&`$select=id,appId,displayName,accountEnabled,appOwnerOrganizationId"
-    foreach ($sp in $r.Rows) { $found[$sp.id] = $sp }
-    foreach ($prefix in 'SkyKick', 'ConnectWise') {
-        $r = Get-GraphPaged "https://graph.microsoft.com/v1.0/servicePrincipals?`$filter=startswith(displayName,'$prefix')&`$select=id,appId,displayName,accountEnabled,appOwnerOrganizationId"
-        foreach ($sp in $r.Rows) { if ($sp.id) { $found[$sp.id] = $sp } }
+    # Filtered here rather than in Graph: Graph rejects $filter on appOwnerOrganizationId (Request_UnsupportedQuery).
+    # Matches the listed app IDs, anything else the vendor tenant publishes, and the names
+    # older tenants show ("SkyKick Cloud Manager").
+    $all = (Get-GraphPaged 'https://graph.microsoft.com/v1.0/servicePrincipals?$select=id,appId,displayName,accountEnabled,appOwnerOrganizationId&$top=999' -Activity 'Enterprise apps').Rows
+    foreach ($sp in $all) {
+        if (-not $sp.id) { continue }
+        if (($sp.appId -and $IocApps.Contains([string]$sp.appId)) -or
+            $sp.appOwnerOrganizationId -eq $VendorOwnerTenantId -or
+            $sp.displayName -match 'SkyKick|ConnectWise') { $found[$sp.id] = $sp }
     }
 
     if ($found.Count -eq 0) {
@@ -389,8 +393,8 @@ function Test-NewCredentials {
     # $CredentialActors: targetObjectId -> audit description, filled by the audit check so findings can be correlated
 
     $sinceUtc = $Since.ToUniversalTime()
-    $apps = (Get-GraphPaged 'https://graph.microsoft.com/v1.0/applications?$select=id,appId,displayName,passwordCredentials,keyCredentials&$top=999').Rows
-    $sps  = (Get-GraphPaged 'https://graph.microsoft.com/v1.0/servicePrincipals?$select=id,appId,displayName,passwordCredentials,keyCredentials,servicePrincipalType,preferredSingleSignOnMode&$top=999').Rows
+    $apps = (Get-GraphPaged 'https://graph.microsoft.com/v1.0/applications?$select=id,appId,displayName,passwordCredentials,keyCredentials&$top=999' -Activity 'App registrations').Rows
+    $sps  = (Get-GraphPaged 'https://graph.microsoft.com/v1.0/servicePrincipals?$select=id,appId,displayName,passwordCredentials,keyCredentials,servicePrincipalType,preferredSingleSignOnMode&$top=999' -Activity 'Enterprise apps').Rows
 
     $count = 0
     foreach ($kind in 'Application', 'ServicePrincipal') {
@@ -456,7 +460,7 @@ function Test-AuditLog {
     $events = [System.Collections.Generic.List[object]]::new()
 
     foreach ($category in 'RoleManagement', 'ApplicationManagement') {
-        $r = Get-GraphPaged "https://graph.microsoft.com/v1.0/auditLogs/directoryAudits?`$filter=activityDateTime ge $sinceIso and category eq '$category'&`$top=999"
+        $r = Get-GraphPaged "https://graph.microsoft.com/v1.0/auditLogs/directoryAudits?`$filter=activityDateTime ge $sinceIso and category eq '$category'&`$top=999" -Activity "$category events"
         foreach ($e in $r.Rows) { $events.Add($e) }
     }
 
@@ -589,7 +593,7 @@ function Test-SignIns {
     try {
         # Every app sign-in for the ConnectWise apps
         foreach ($appId in $IocApps.Keys) {
-            $r = Get-GraphPaged "$base`?`$filter=createdDateTime ge $sinceIso and appId eq '$appId' and signInEventTypes/any(t: t eq 'servicePrincipal')&`$top=500" -MaxPages $MaxSignInPages
+            $r = Get-GraphPaged "$base`?`$filter=createdDateTime ge $sinceIso and appId eq '$appId' and signInEventTypes/any(t: t eq 'servicePrincipal')&`$top=500" -MaxPages $MaxSignInPages -Activity $IocApps[$appId].Name
             if ($r.Rows.Count) { Add-SignInFindings -Rows $r.Rows -Label "service principal ($($IocApps[$appId].Name))" -Truncated $r.Truncated }
         }
 
@@ -597,7 +601,7 @@ function Test-SignIns {
         $ipHits = 0
         foreach ($ip in $IocIps.Keys) {
             foreach ($type in 'interactiveUser', 'nonInteractiveUser', 'servicePrincipal', 'managedIdentity') {
-                $r = Get-GraphPaged "$base`?`$filter=createdDateTime ge $sinceIso and ipAddress eq '$ip' and signInEventTypes/any(t: t eq '$type')&`$top=500" -MaxPages $MaxSignInPages
+                $r = Get-GraphPaged "$base`?`$filter=createdDateTime ge $sinceIso and ipAddress eq '$ip' and signInEventTypes/any(t: t eq '$type')&`$top=500" -MaxPages $MaxSignInPages -Activity "$ip $type"
                 # The ConnectWise app sign-ins were already reported above
                 $rows = @($r.Rows | Where-Object { -not ($type -eq 'servicePrincipal' -and $IocApps.Contains([string]$_.appId)) })
                 if ($rows.Count) { $ipHits += $rows.Count; Add-SignInFindings -Rows $rows -Label $type -Truncated $r.Truncated }
@@ -787,6 +791,9 @@ try {
     if ($tenants.Count -eq 0) { throw 'No tenants to audit.' }
 
     if (-not (Test-Path -LiteralPath $OutputPath)) { New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null }
+    $csv  = Join-Path $OutputPath 'Findings.csv'
+    $html = Join-Path $OutputPath 'Report.html'
+    if (Test-Path -LiteralPath $csv) { Remove-Item -LiteralPath $csv }   # per-tenant saves append
 
     $i = 0
     foreach ($t in $tenants) {
@@ -812,6 +819,7 @@ try {
                 -Detail "Could not connect: $(Get-ErrorText $_). Check GDAP roles and that Microsoft Graph Command Line Tools is consented in this tenant." `
                 -WhereToLook 'Partner Center > Customers > (customer) > Admin relationships' -PortalUrl ''
             Write-Warning "Could not connect to $($t.Name): $(Get-ErrorText $_)"
+            $Findings | Where-Object TenantId -eq $script:Tenant.Id | Export-Csv -LiteralPath $csv -NoTypeInformation -Encoding UTF8 -Append
             continue
         }
 
@@ -833,12 +841,16 @@ try {
         $s = $tenantFindings | Group-Object Severity
         Write-Host ''
         Write-Host ("Summary for {0}: {1}" -f $script:Tenant.Name, (($s | Sort-Object { $SeverityOrder[$_.Name] } | ForEach-Object { "$($_.Count) $($_.Name)" }) -join ', ')) -ForegroundColor White
+
+        # Saved per tenant so stopping a long multi-tenant run keeps what is already done
+        $tenantFindings | Sort-Object { $SeverityOrder[$_.Severity] }, Category, When |
+            Export-Csv -LiteralPath $csv -NoTypeInformation -Encoding UTF8 -Append
+        Write-Host "Saved to $csv" -ForegroundColor DarkGray
     }
 
     Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
 
-    $csv  = Join-Path $OutputPath 'Findings.csv'
-    $html = Join-Path $OutputPath 'Report.html'
+    # Rewrite the CSV sorted across all tenants, and build the HTML
     $sorted = $Findings | Sort-Object Tenant, { $SeverityOrder[$_.Severity] }, Category, When
     $sorted | Export-Csv -LiteralPath $csv -NoTypeInformation -Encoding UTF8
     Export-HtmlReport -Items $sorted -Path $html
