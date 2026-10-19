@@ -2,6 +2,21 @@
 
 All notable changes to this repository are documented here. Entries are grouped by date where commit history allows, otherwise by theme.
 
+## 2026-10-19
+
+### Windows/Applications - Uninstall OneDrive (new script)
+
+Removes the OneDrive sync app from every profile on a machine and keeps it from coming back, for a client that wants OneDrive gone fleet-wide. Runs as SYSTEM from NinjaOne with no prompts, no Explorer restart and no reboot.
+
+- **Every reinstall route is covered.** Per-user installs (removed directly from SYSTEM, whether or not the user is signed in, with offline hives loaded as needed), per-machine `/allusers` installs, the `OneDriveSetup /thfirstsetup` Run value in the Default user hive that installs OneDrive for every new profile (present on the test machine), self-update and reporting tasks (including an orphaned one for a profile that no longer exists), and the `Microsoft.OneDriveSync` package. The policy `DisableFileSyncNGSC = 1` ("Prevent the usage of OneDrive for file storage") is what makes the removal stick: if a feature update or an Office install or repair puts OneDrive back, it does not run.
+- **OneDrive's own uninstaller is not used for per-user installs.** Run as SYSTEM it only uninstalls for SYSTEM. The first version ran it as each signed-in user through a one-shot scheduled task, and in testing it showed the user a prompt and waited on it. The script now removes what that uninstaller would have unregistered by itself: the COM classes and protocol handlers in the user's hive that point into the program folder (72 on the test machine), plus the overlay icon handlers, navigation pane entries and sync roots.
+- **User files are never deleted.** Only OneDrive's program folders are removed. The delete routine refuses any other path, and refuses a tree that contains a junction or symlink, because `Remove-Item -Recurse` on 5.1 can follow one. Verified: the test user's OneDrive folder held 5,938 items before and after.
+- **Known Folder Move users are skipped by default.** Removing OneDrive from a user whose Desktop and Documents are redirected into it would leave those folders showing only the files that were stored locally. Such profiles are reported, the policy and per-machine removal are held back on that machine, and the script exits 1. `-IncludeKnownFolderMoveUsers` overrides this. Detection reads shell folder paths unexpanded and expands them against the user's own profile, not SYSTEM's.
+- **Locked files go at the next natural restart.** Explorer can keep the shell extension DLL loaded, so those files are queued with `MoveFileEx(MOVEFILE_DELAY_UNTIL_REBOOT)`. This has to be called through a C# wrapper: from PowerShell, `$null` reaches a .NET string parameter as `""`, and `MoveFileEx` then fails with `ERROR_PATH_NOT_FOUND`. That silently queued nothing in the first test run.
+- A Microsoft 365 Apps install that does not exclude OneDrive is reported, not changed. The fix belongs in the Office Deployment Tool config (`<ExcludeApp ID="OneDrive" />`).
+- `-DryRun` surveys and reports without changing anything, for finding Known Folder Move users across the fleet first. All three switches are available as NinjaOne checkbox variables.
+- Tested on Windows 11 (26300) against a real signed-in per-user install, twice: once against the original install and once after a silent reinstall from the Windows-shipped `OneDriveSetup.exe`. A third run confirmed the script is safe to repeat: it only queued the files left locked by the first run and exited 0.
+
 ## 2026-08-25
 
 ### RMM - Reinstall NinjaRMM Agent (architecture change, v3.0.0)

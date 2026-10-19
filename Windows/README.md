@@ -68,6 +68,7 @@ Scripts are organized into subfolders by function. For guidance on downloading a
 | [Uninstall ESET Antivirus.bat](Applications/Uninstall%20ESET%20Antivirus.bat) | Removes ESET endpoint antivirus |
 | [Uninstall Huntress.bat](Applications/Uninstall%20Huntress.bat) | Removes the Huntress agent |
 | [Uninstall Malwarebytes.ps1](Applications/Uninstall%20Malwarebytes.ps1) | Silently uninstalls Malwarebytes |
+| [Uninstall OneDrive.ps1](Applications/Uninstall%20OneDrive.ps1) | Silently removes OneDrive for every user and blocks it from reinstalling or running; skips Known Folder Move users, no prompts or reboot |
 | [Uninstall Out-N-About.bat](Applications/Uninstall%20Out-N-About.bat) | Removes Out-N-About time tracking software |
 | [Uninstall Sage Timeslips.bat](Applications/Uninstall%20Sage%20Timeslips.bat) | Removes Sage Timeslips |
 | [Uninstall ScreenConnect.ps1](Applications/Uninstall%20ScreenConnect.ps1) | Silently removes all installed ScreenConnect (ConnectWise Control) Client instances, no reboot |
