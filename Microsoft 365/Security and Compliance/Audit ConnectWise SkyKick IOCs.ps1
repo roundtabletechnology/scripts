@@ -218,15 +218,23 @@ function Get-GraphPaged {
     $next  = $Uri
     $truncated = $false
     $cap = if ($MaxPages -gt 0) { "/$MaxPages" } else { '' }
+    $width = 0   # longest progress line so far, so the final line fully overwrites it
     while ($next) {
-        if ($Activity) { Write-Host ("`r    {0}: page {1}{2}, {3} rows so far   " -f $Activity, ($page + 1), $cap, $rows.Count) -NoNewline -ForegroundColor DarkGray }
+        if ($Activity) {
+            $line  = "    {0}: page {1}{2}, {3} rows so far" -f $Activity, ($page + 1), $cap, $rows.Count
+            $width = [math]::Max($width, $line.Length)
+            Write-Host ("`r" + $line) -NoNewline -ForegroundColor DarkGray
+        }
         $resp = Invoke-MgGraphRequest -Method GET -Uri $next -OutputType Hashtable
         if ($resp.value) { foreach ($r in $resp.value) { $rows.Add($r) } }
         $next = $resp.'@odata.nextLink'
         $page++
         if ($MaxPages -gt 0 -and $page -ge $MaxPages -and $next) { $truncated = $true; break }
     }
-    if ($Activity) { Write-Host ("`r    {0}: {1} rows{2}          " -f $Activity, $rows.Count, $(if ($truncated) { " (stopped at $MaxPages pages)" })) -ForegroundColor DarkGray }
+    if ($Activity) {
+        $line = "    {0}: {1} rows{2}" -f $Activity, $rows.Count, $(if ($truncated) { " (stopped at $MaxPages pages)" })
+        Write-Host ("`r" + $line.PadRight($width)) -ForegroundColor DarkGray
+    }
     [pscustomobject]@{ Rows = $rows; Truncated = $truncated }
 }
 
@@ -618,15 +626,29 @@ function Add-SignInFindings {
 }
 
 function Test-SignIns {
+    param([hashtable]$VendorSps, [bool]$VendorListKnown)
     $sinceIso = $Since.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
     # Service principal sign-ins are only exposed through the beta endpoint
     $base = 'https://graph.microsoft.com/beta/auditLogs/signIns'
 
+    # An app cannot sign in to a tenant it has no service principal in, so only query the
+    # ConnectWise apps present here; these queries are slow. If the app list could not be read,
+    # fall back to every listed app. The IOC IP queries below run regardless.
+    $targets = [ordered]@{}
+    if ($VendorListKnown) {
+        foreach ($sp in $VendorSps.Values) { $targets[[string]$sp.appId] = $sp.displayName }
+    } else {
+        foreach ($appId in $IocApps.Keys) { $targets[$appId] = $IocApps[$appId].Name }
+    }
+
     try {
         # Every app sign-in for the ConnectWise apps
-        foreach ($appId in $IocApps.Keys) {
-            $r = Get-GraphPaged "$base`?`$filter=createdDateTime ge $sinceIso and appId eq '$appId' and signInEventTypes/any(t: t eq 'servicePrincipal')&`$top=500" -MaxPages $MaxSignInPages -Activity $IocApps[$appId].Name
-            if ($r.Rows.Count) { Add-SignInFindings -Rows $r.Rows -Label "service principal ($($IocApps[$appId].Name))" -Truncated $r.Truncated }
+        foreach ($appId in $targets.Keys) {
+            $r = Get-GraphPaged "$base`?`$filter=createdDateTime ge $sinceIso and appId eq '$appId' and signInEventTypes/any(t: t eq 'servicePrincipal')&`$top=500" -MaxPages $MaxSignInPages -Activity $targets[$appId]
+            if ($r.Rows.Count) { Add-SignInFindings -Rows $r.Rows -Label "service principal ($($targets[$appId]))" -Truncated $r.Truncated }
+        }
+        if ($VendorListKnown -and $targets.Count -eq 0) {
+            Write-Host '    No ConnectWise/SkyKick apps in this tenant; skipping their sign-in queries.' -ForegroundColor DarkGray
         }
 
         # Anything at all from the IOC IPs (password spray against users, other apps)
@@ -994,7 +1016,7 @@ try {
         $credActors = Invoke-Check 'Audit log' { Test-AuditLog }
         if ($credActors -isnot [hashtable]) { $credActors = @{} }
         Invoke-Check 'New secrets and certificates' { Test-NewCredentials -CredentialActors $credActors } | Out-Null
-        Invoke-Check 'Sign-in logs' { Test-SignIns } | Out-Null
+        Invoke-Check 'Sign-in logs' { Test-SignIns -VendorSps $vendorSps -VendorListKnown ($null -ne $script:AllSps) } | Out-Null
         Invoke-Check 'Conditional Access' { Test-ConditionalAccess -VendorSps $vendorSps } | Out-Null
         Invoke-Check 'Vendor app permissions' { Test-VendorPermissions -VendorSps $vendorSps } | Out-Null
         Invoke-Check 'Third-party app inventory' { Get-AppInventory -VendorSps $vendorSps } | Out-Null
