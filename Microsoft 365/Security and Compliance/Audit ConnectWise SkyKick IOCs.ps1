@@ -34,6 +34,11 @@
          other apps you may want to remove; it goes to Apps.csv and its own
          section of the HTML report, separate from the IOC findings.
 
+    Known-good vendors (Phin Security, NinjaOne SaaS Backup) are listed in
+    $ExpectedApps near the top. A match quiets their privileged-role and
+    high-risk-permission flags but never their credential, audit log or
+    sign-in findings. Add other confirmed vendors there.
+
     Every finding includes the portal path and a direct link (opened in the
     right tenant) so you can review, disable or delete it yourself in the UI.
     Results go to the console, a CSV and an HTML report.
@@ -173,6 +178,21 @@ $PrivilegedRoles = @{
     '9360feb5-f418-4baa-8175-e2a00bac4301' = 'Directory Writers'
 }
 
+# Apps you have confirmed are legitimate. A match quiets only the low-signal flags: a privileged role
+# listed in Roles, and the inventory's high-risk / unverified-publisher flags. It never hides
+# credential, audit log or sign-in findings - Huntress saw the actor add secrets to a trusted
+# vendor's app. Match on OwnerTenant (the publisher's tenant, same in every customer), or on
+# NamePattern plus UrlPattern for apps a vendor creates inside each customer tenant.
+$ExpectedApps = @(
+    @{ Vendor = 'Phin Security'; OwnerTenant = '44fbbc8f-29ec-4311-bc8a-1dce07ccacb6'
+       Roles = @('Exchange Administrator'); Reason = 'security awareness training and phishing simulation (allowlisting, message injection)' }
+    @{ Vendor = 'NinjaOne SaaS Backup'; OwnerTenant = '8ec442cf-7901-4df7-b93d-7f0fb1e7cd8e'
+       Roles = @(); Reason = 'SaaS backup' }
+    # Created in each customer tenant with a random suffix, so require the name AND a NinjaOne URL
+    @{ Vendor = 'NinjaOne SaaS Backup'; NamePattern = '^Backup Application [A-Za-z0-9]{4}$'; UrlPattern = 'ninja'; OwnTenantOnly = $true
+       Roles = @(); Reason = 'per-tenant backup app created by NinjaOne SaaS Backup' }
+)
+
 # App inventory: tenants that publish Microsoft's own apps (excluded from the third-party list)
 $MicrosoftOwnerTenants = @('f8cdef31-a31e-4b4a-93e4-5f571e91255a', '72f988bf-86f1-41af-91ab-2d7cd011db47')
 
@@ -244,6 +264,20 @@ function ConvertTo-UtcDate {
     if ($Value -is [datetime]) { return $Value.ToUniversalTime() }
     [datetime]::Parse($Value, [Globalization.CultureInfo]::InvariantCulture,
         [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal)
+}
+
+function Get-ExpectedApp {
+    # Returns the matching $ExpectedApps entry for a service principal, or $null
+    param($Sp)
+    if (-not $Sp) { return $null }
+    $urls = (@($Sp.homepage) + @($Sp.replyUrls) | Where-Object { $_ }) -join ' '
+    foreach ($e in $ExpectedApps) {
+        if ($e.OwnerTenant -and [string]$Sp.appOwnerOrganizationId -eq $e.OwnerTenant) { return $e }
+        if ($e.NamePattern -and $Sp.displayName -match $e.NamePattern -and
+            (-not $e.UrlPattern -or $urls -match $e.UrlPattern) -and
+            (-not $e.OwnTenantOnly -or [string]$Sp.appOwnerOrganizationId -eq [string]$script:Tenant.Id)) { return $e }
+    }
+    $null
 }
 
 function Format-Utc { param($Value) $d = ConvertTo-UtcDate $Value; if ($d) { $d.ToString('yyyy-MM-dd HH:mm') + ' UTC' } }
@@ -328,7 +362,7 @@ function Test-VendorApps {
     # Filtered here rather than in Graph: Graph rejects $filter on appOwnerOrganizationId (Request_UnsupportedQuery).
     # Matches the listed app IDs, anything else the vendor tenant publishes, and the names
     # older tenants show ("SkyKick Cloud Manager").
-    $all = (Get-GraphPaged 'https://graph.microsoft.com/v1.0/servicePrincipals?$select=id,appId,displayName,accountEnabled,appOwnerOrganizationId,servicePrincipalType,publisherName,verifiedPublisher,appRoles&$top=999' -Activity 'Enterprise apps').Rows
+    $all = (Get-GraphPaged 'https://graph.microsoft.com/v1.0/servicePrincipals?$select=id,appId,displayName,accountEnabled,appOwnerOrganizationId,servicePrincipalType,publisherName,verifiedPublisher,appRoles,homepage,replyUrls&$top=999' -Activity 'Enterprise apps').Rows
     $script:AllSps = $all   # reused by the app inventory
     foreach ($sp in $all) {
         if (-not $sp.id) { continue }
@@ -418,10 +452,16 @@ function Test-RoleAssignments {
                 -Detail "ConnectWise/SkyKick app holds $roleName ($($a.__kind))$scope. Huntress saw these apps assign themselves Exchange Administrator and Global Administrator." `
                 -WhereToLook $where -PortalUrl $url `
                 -Action 'Unless you intentionally granted this role, select the app on the role''s Assignments page and Remove assignment. Then check the audit log findings for who added it and when.'
+        } elseif (($exp = Get-ExpectedApp $sp) -and $exp.Roles -contains $roleName) {
+            Add-Finding -Severity Info -Category 'Directory roles' `
+                -Object "$($sp.displayName) ($($sp.appId))" `
+                -Detail "Expected: $($exp.Vendor) ($($exp.Reason)) holds $roleName ($($a.__kind))$scope, which it needs." `
+                -WhereToLook $where -PortalUrl $url
         } else {
+            $note = if ($exp) { "Expected $($exp.Vendor) app, but $roleName is not a role it normally needs; confirm with the vendor." } else { 'Not a ConnectWise app; confirm it is expected.' }
             Add-Finding -Severity Review -Category 'Directory roles' `
                 -Object "$($sp.displayName) ($($sp.appId))" `
-                -Detail "Service principal holds privileged role $roleName ($($a.__kind))$scope. Not a ConnectWise app; confirm it is expected." `
+                -Detail "Service principal holds privileged role $roleName ($($a.__kind))$scope. $note" `
                 -WhereToLook $where -PortalUrl $url `
                 -Action 'Confirm the app is known and needs this role. Remove the assignment if not.'
         }
@@ -759,7 +799,7 @@ function Get-AppInventory {
 
     $all = $script:AllSps
     if (-not $all) {
-        $all = (Get-GraphPaged 'https://graph.microsoft.com/v1.0/servicePrincipals?$select=id,appId,displayName,accountEnabled,appOwnerOrganizationId,servicePrincipalType,publisherName,verifiedPublisher,appRoles&$top=999' -Activity 'Enterprise apps').Rows
+        $all = (Get-GraphPaged 'https://graph.microsoft.com/v1.0/servicePrincipals?$select=id,appId,displayName,accountEnabled,appOwnerOrganizationId,servicePrincipalType,publisherName,verifiedPublisher,appRoles,homepage,replyUrls&$top=999' -Activity 'Enterprise apps').Rows
     }
     $byId = @{}
     foreach ($sp in $all) { if ($sp.id) { $byId[$sp.id] = $sp } }
@@ -831,11 +871,13 @@ function Get-AppInventory {
         }
         $stale = -not $signInNote -and (-not $last -or $last -lt $staleBefore)
 
+        $exp   = Get-ExpectedApp $sp
         $flags = @()
+        if ($exp)                  { $flags += "Expected: $($exp.Vendor)" }
         if ($isVendor)             { $flags += 'ConnectWise/SkyKick (see IOC findings)' }
         if ($risky.Count)          { $flags += 'High-risk permissions' }
         if ($stale)                { $flags += 'Unused 90+ days' }
-        if (-not $verified -and $owner -ne 'This tenant (custom app)') { $flags += 'Unverified publisher' }
+        if (-not $verified -and -not $exp -and $owner -ne 'This tenant (custom app)') { $flags += 'Unverified publisher' }
 
         $count++
         $AppInventory.Add([pscustomobject]@{
@@ -849,6 +891,7 @@ function Get-AppInventory {
             VerifiedPublisher    = $verified
             OwnerTenant          = $owner
             LastSignIn           = $lastText
+            Expected             = $(if ($exp) { $exp.Vendor } else { '' })
             HighRiskPermissions  = $risky -join '; '
             AppPermissions       = $perms -join '; '
             AdminDelegatedScopes = $scopes -join '; '
@@ -859,10 +902,11 @@ function Get-AppInventory {
     }
 
     $mine  = @($AppInventory | Where-Object TenantId -eq $script:Tenant.Id)
-    $riskN = @($mine | Where-Object HighRiskPermissions).Count
+    $riskN = @($mine | Where-Object { $_.HighRiskPermissions -and -not $_.Expected }).Count
+    $expN  = @($mine | Where-Object Expected).Count
     $staleN = @($mine | Where-Object { $_.Flags -like '*Unused 90+ days*' }).Count
     Add-Finding -Severity Info -Category 'App inventory' -Object "$count third-party enterprise apps" `
-        -Detail "$riskN with high-risk permissions, $(if ($signInNote) { 'last sign-in unknown (needs Entra ID P1)' } else { "$staleN unused for 90+ days" }). Full list in Apps.csv and the app inventory section of the HTML report." `
+        -Detail "$riskN unexpected with high-risk permissions ($expN apps marked expected), $(if ($signInNote) { 'last sign-in unknown (needs Entra ID P1)' } else { "$staleN unused for 90+ days" }). Full list in Apps.csv and the app inventory section of the HTML report." `
         -WhereToLook 'Entra admin center > Enterprise apps > All applications (Application type: Enterprise Applications)' `
         -PortalUrl "$(Get-PortalBase)/Microsoft_AAD_IAM/StartboardApplicationsMenuBlade/~/AppAppsPreview"
 }
@@ -929,7 +973,7 @@ Source: <a href="https://www.huntress.com/blog/vendor-credential-enables-unautho
             [void]$sb.Append("<h3>Third-party app inventory ($($tApps.Count))</h3><p class='small'>Not IOC findings: every non-Microsoft enterprise app, for spotting others to remove. To remove one: open it, set <i>Enabled for users to sign-in?</i> to No to test, then Delete. Turn off user consent (Enterprise apps &gt; Consent and permissions) so users cannot add it back. Do not delete ConnectWise apps; disable them.</p>")
             [void]$sb.Append('<table><tr><th>App</th><th>Flags</th><th>Enabled</th><th>Publisher</th><th>Last sign-in</th><th>High-risk permissions</th><th>All permissions</th><th>User consents</th></tr>')
             foreach ($a in $tApps) {
-                $cls  = if ($a.HighRiskPermissions) { 'Review' } else { '' }
+                $cls  = if ($a.HighRiskPermissions -and -not $a.Expected) { 'Review' } else { '' }
                 $pub  = if ($a.VerifiedPublisher) { "$(& $enc $a.VerifiedPublisher) (verified)" } elseif ($a.Publisher) { "$(& $enc $a.Publisher) (unverified)" } else { 'unknown' }
                 $pub += "<br><span class='small'>$(& $enc $a.OwnerTenant)</span>"
                 $permsAll = @()
@@ -1052,7 +1096,13 @@ try {
 
         # Saved per tenant so stopping a long multi-tenant run keeps what is already done
         $tenantApps = @($AppInventory | Where-Object TenantId -eq $script:Tenant.Id | Sort-Object { -not $_.HighRiskPermissions }, App)
-        $riskyApps  = @($tenantApps | Where-Object HighRiskPermissions)
+        $riskyApps  = @($tenantApps | Where-Object { $_.HighRiskPermissions -and -not $_.Expected })
+        $staleExpected = @($tenantApps | Where-Object { $_.Expected -and $_.Flags -like '*Unused 90+ days*' })
+        if ($staleExpected) {
+            Write-Host ''
+            Write-Host 'Expected apps unused for 90+ days (ask the vendor before removing):' -ForegroundColor White
+            foreach ($a in $staleExpected) { Write-Host ("  {0} ({1}) - last sign-in {2}" -f $a.App, $a.Expected, $a.LastSignIn) -ForegroundColor Gray }
+        }
         if ($riskyApps) {
             Write-Host ''
             Write-Host "Third-party apps with high-risk permissions (full inventory in Apps.csv):" -ForegroundColor White
