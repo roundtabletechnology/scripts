@@ -4,6 +4,16 @@ All notable changes to this repository are documented here. Entries are grouped 
 
 ## 2026-10-19
 
+### Microsoft 365/Security and Compliance - Audit ConnectWise SkyKick IOCs (new script, not yet run against a real tenant)
+
+Read-only audit for the ConnectWise Cloud Backup (formerly SkyKick) vendor credential compromise in the [Huntress advisory](https://www.huntress.com/blog/vendor-credential-enables-unauthorized-access). It runs against one tenant, a list of tenants, or every GDAP customer (`-AllCustomers`), and **changes nothing**: it requests read scopes only, and its one POST is the read-only `directoryObjects/getByIds`.
+
+- **Checks:** the seven published ConnectWise app IDs, plus any other service principal owned by the vendor tenant `3f9cd7a0-...` or named SkyKick/ConnectWise (older tenants show "SkyKick Cloud Manager"); directory roles those apps hold (active, and PIM-eligible where P2 allows), and every other service principal holding a privileged role; secrets and certificates added to **any** app registration or enterprise app since `-Since` (default 2026-10-13), with 2028 expiry flagged to match the actor; role, credential and consent events in the Entra audit log performed by an app, from an IOC IP or with an IOC user agent; service principal sign-ins to the ConnectWise apps and any sign-in from the IOC IPs; Conditional Access exclusions for the apps.
+- **Every finding says where to go:** a portal path, a deep link opened in the right tenant (`portal.azure.com/#@<tenant>/...` so GDAP works), and the action to take. App findings say to **disable, not delete**, per Huntress. Results go to the console, `Findings.csv` and `Report.html`.
+- **Correlation:** a new credential that the audit log shows was added by an app is raised to Critical. Service principal-level secrets are not shown in the portal, so those findings give the Graph Explorer query and the removal command instead (the script does not run it).
+- **No Entra ID P1/P2:** sign-in logs cannot be read through Graph, so this is reported as a manual check instead of failing. Each check runs on its own, so a missing permission or license only skips that check.
+- Tested in PowerShell 7.4 and 5.1 against a stubbed Graph covering a compromised tenant (self-assigned Global Administrator, secrets added by an app, actor-IP sign-ins, a password-spray user, a CA exclusion), a tenant without P1, and a tenant that refuses sign-in. **Still to confirm against a real tenant:** the beta service principal sign-in filter, the `appOwnerOrganizationId` filter, and the portal deep-link formats.
+
 ### Mac/Applications - Uninstall OneDrive (new script, not yet run on a real Mac)
 
 The macOS counterpart of the Windows script above, for the same client. **Tested in a Mac-shaped Linux sandbox with the macOS commands stubbed (33 checks), not yet on real hardware - first lab run is via NinjaOne.**
