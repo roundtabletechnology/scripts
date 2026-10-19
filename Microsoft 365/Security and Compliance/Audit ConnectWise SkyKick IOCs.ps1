@@ -245,7 +245,8 @@ function Get-GraphPaged {
             $width = [math]::Max($width, $line.Length)
             Write-Host ("`r" + $line) -NoNewline -ForegroundColor DarkGray
         }
-        $resp = Invoke-MgGraphRequest -Method GET -Uri $next -OutputType Hashtable
+        try { $resp = Invoke-MgGraphRequest -Method GET -Uri $next -OutputType Hashtable }
+        catch { if ($Activity) { Write-Host '' }; throw }   # end the progress line so the next output starts clean
         if ($resp.value) { foreach ($r in $resp.value) { $rows.Add($r) } }
         $next = $resp.'@odata.nextLink'
         $page++
@@ -325,6 +326,8 @@ function Get-SignInLogUrl { "$(Get-PortalBase)/Microsoft_AAD_IAM/ActiveDirectory
 
 $Findings = [System.Collections.Generic.List[object]]::new()
 $AppInventory = [System.Collections.Generic.List[object]]::new()
+$Checklist    = [System.Collections.Generic.List[object]]::new()
+$Verdicts     = [ordered]@{}   # tenant ID -> verdict
 $SeverityOrder = @{ Critical = 0; High = 1; Review = 2; Info = 3 }
 
 function Add-Finding {
@@ -543,6 +546,7 @@ function Test-AuditLog {
         $r = Get-GraphPaged "https://graph.microsoft.com/v1.0/auditLogs/directoryAudits?`$filter=activityDateTime ge $sinceIso and category eq '$category'&`$top=999" -Activity "$category events"
         foreach ($e in $r.Rows) { $events.Add($e) }
     }
+    $script:State.AuditEvents = $events.Count
 
     $roleAdd   = '^Add (eligible )?member to role'
     $credAdd   = 'Certificates and secrets management|Add service principal credentials'
@@ -699,10 +703,19 @@ function Test-SignIns {
         foreach ($appId in $IocApps.Keys) { $targets[$appId] = $IocApps[$appId].Name }
     }
 
+    $st = $script:State
+    $st.AppTargets = $targets.Count; $st.AppSignIns = 0; $st.AppIocHits = 0; $st.AppTruncated = $false
+    $st.IpHits = 0; $st.IpSuccess = 0
     try {
         # Every app sign-in for the ConnectWise apps
         foreach ($appId in $targets.Keys) {
             $r = Get-GraphPaged "$base`?`$filter=createdDateTime ge $sinceIso and appId eq '$appId' and signInEventTypes/any(t: t eq 'servicePrincipal')&`$top=500" -MaxPages $MaxSignInPages -Activity $targets[$appId]
+            $st.AppSignIns += $r.Rows.Count
+            if ($r.Truncated) { $st.AppTruncated = $true }
+            $iocRows = @($r.Rows | Where-Object { $IocIps.ContainsKey([string]$_.ipAddress) })
+            $st.AppIocHits += $iocRows.Count
+            $st.IpHits     += $iocRows.Count
+            $st.IpSuccess  += @($iocRows | Where-Object { $_.status.errorCode -eq 0 }).Count
             if ($r.Rows.Count) { Add-SignInFindings -Rows $r.Rows -Label "service principal ($($targets[$appId]))" -Truncated $r.Truncated }
         }
         if ($VendorListKnown -and $targets.Count -eq 0) {
@@ -716,7 +729,12 @@ function Test-SignIns {
                 $r = Get-GraphPaged "$base`?`$filter=createdDateTime ge $sinceIso and ipAddress eq '$ip' and signInEventTypes/any(t: t eq '$type')&`$top=500" -MaxPages $MaxSignInPages -Activity "$ip $type"
                 # The ConnectWise app sign-ins were already reported above
                 $rows = @($r.Rows | Where-Object { -not ($type -eq 'servicePrincipal' -and $IocApps.Contains([string]$_.appId)) })
-                if ($rows.Count) { $ipHits += $rows.Count; Add-SignInFindings -Rows $rows -Label $type -Truncated $r.Truncated }
+                if ($rows.Count) {
+                    $ipHits += $rows.Count
+                    $st.IpHits    += $rows.Count
+                    $st.IpSuccess += @($rows | Where-Object { $_.status.errorCode -eq 0 }).Count
+                    Add-SignInFindings -Rows $rows -Label $type -Truncated $r.Truncated
+                }
             }
         }
         Add-Finding -Severity Info -Category 'Sign-ins' -Object 'IOC IP addresses' `
@@ -725,8 +743,10 @@ function Test-SignIns {
     } catch {
         $msg = Get-ErrorText $_
         if ($msg -match 'NonPremium|RequestFromNonPremiumTenant|premium') {
-            Add-Finding -Severity Review -Category 'Sign-ins' -Object 'Sign-in logs' `
-                -Detail 'Tenant has no Entra ID P1/P2, so sign-in logs cannot be read through Graph. The portal shows the last 7 days only.' `
+            $st.NoPremium = $true
+            $short = if ($msg -match '"message"\s*:\s*"([^"]+)"') { $Matches[1] } else { $msg.Substring(0, [math]::Min(200, $msg.Length)) }
+            Add-Finding -Severity Review -Category 'Sign-ins' -Object 'Sign-in logs NOT CHECKED' `
+                -Detail "Microsoft refused to return sign-in logs because the tenant has no Entra ID P1/P2 (Microsoft said: $short). Sign-ins from the actor IPs and by the ConnectWise apps were NOT checked. The portal shows the last 7 days only." `
                 -WhereToLook "Entra admin center > Monitoring & health > Sign-in logs > Service principal sign-ins > filter Application ID 506e08f9-6e9a-4da4-942b-a099a03644ae; User sign-ins > filter IP 144.172.64.128" `
                 -PortalUrl (Get-SignInLogUrl) -Action 'Check manually in the portal, or in the Purview unified audit log.'
         } else { throw }
@@ -924,6 +944,128 @@ function Invoke-Check {
     }
 }
 
+function Get-TenantChecklist {
+    # One row per indicator with a plain status, so "not found" and "could not check" are never confused.
+    param([hashtable]$VendorSps, $TenantFindings)
+    $st     = $script:State
+    $failed = @($TenantFindings | Where-Object Category -eq 'Audit failed' | ForEach-Object { $_.Object })
+    $sinceText = Format-Utc $Since
+    $rows   = [System.Collections.Generic.List[object]]::new()
+    $add = { param($Check, $Status, $Result, $Where)
+        $rows.Add([pscustomobject]@{ Tenant = $script:Tenant.Name; TenantId = $script:Tenant.Id; Check = $Check; Status = $Status; Result = $Result; WhereToLook = $Where }) }
+    $sev = { param($Category, [string[]]$Levels) @($TenantFindings | Where-Object { $_.Category -eq $Category -and $Levels -contains $_.Severity }) }
+
+    # Log retention: Free keeps 7 days, P1/P2 30. Only known to be Free when the sign-in API said so.
+    $retention = if ($st.NoPremium) { 7 } else { 30 }
+    $agedOut   = $Since.ToUniversalTime() -lt [datetime]::UtcNow.AddDays(-$retention)
+    $ageNote   = if ($agedOut) { " This tenant keeps $retention days of logs, so activity before $(Format-Utc ([datetime]::UtcNow.AddDays(-$retention))) is no longer available." } else { '' }
+    $noP1      = 'NOT CHECKED: this tenant has no Entra ID P1/P2, so Microsoft will not return sign-in logs to scripts. Check by hand in the portal (last 7 days only) or the Purview unified audit log.'
+    $ips       = ($IocIps.Keys | Sort-Object) -join ', '
+
+    # 1. Actor IPs in sign-in logs
+    $c = "Sign-ins from actor IPs ($ips)"
+    if ($failed -contains 'Sign-in logs')  { & $add $c 'Failed' 'The sign-in check errored; see the Audit failed finding. Check by hand.' 'Sign-in logs > each tab > filter IP address' }
+    elseif ($st.NoPremium)                 { & $add $c 'Not checked' $noP1 'Sign-in logs > User sign-ins and Service principal sign-ins > filter IP address 144.172.64.128' }
+    elseif ($null -eq $st.IpHits)          { & $add $c 'Not checked' 'The sign-in check did not run.' '' }
+    elseif ($st.IpHits -gt 0)              { & $add $c 'Found' "$($st.IpHits) sign-in(s) from actor IPs since $sinceText, $($st.IpSuccess) successful. See the Sign-ins findings." 'Sign-in logs > filter IP address' }
+    else { & $add $c $(if ($agedOut) { 'Partial' } else { 'Clear' }) "No sign-ins from these IPs since $sinceText (user interactive, user non-interactive, app and managed identity sign-ins all searched).$ageNote" 'Sign-in logs' }
+
+    # 2. ConnectWise app sign-ins
+    $c = 'ConnectWise/SkyKick app sign-ins'
+    if ($failed -contains 'Sign-in logs')  { & $add $c 'Failed' 'The sign-in check errored. Check by hand.' 'Sign-in logs > Service principal sign-ins > filter Application ID' }
+    elseif ($st.NoPremium)                 { & $add $c 'Not checked' $noP1 'Sign-in logs > Service principal sign-ins > filter Application ID 506e08f9-6e9a-4da4-942b-a099a03644ae' }
+    elseif ($null -eq $st.AppTargets)      { & $add $c 'Not checked' 'The sign-in check did not run.' '' }
+    elseif ($st.AppTargets -eq 0)          { & $add $c 'Clear' 'No ConnectWise/SkyKick apps in this tenant, so none can sign in.' '' }
+    elseif ($st.AppIocHits -gt 0)          { & $add $c 'Found' "$($st.AppIocHits) ConnectWise app sign-in(s) from actor IPs since $sinceText. See the Sign-ins findings." 'Sign-in logs > Service principal sign-ins' }
+    else {
+        $trunc = if ($st.AppTruncated) { ' Large volume: stopped at -MaxSignInPages, but actor-IP sign-ins are searched separately and completely.' } else { '' }
+        & $add $c $(if ($agedOut) { 'Partial' } else { 'Clear' }) "$($st.AppSignIns) sign-in(s) by $($st.AppTargets) ConnectWise app(s) since $sinceText; none from actor IPs. Unfamiliar source IPs, if any, are listed as Sign-ins findings.$trunc$ageNote" 'Sign-in logs > Service principal sign-ins'
+    }
+
+    # 3. Audit log: changes made by apps, from actor IPs or with IOC user agents
+    $c = 'Role/credential changes made by apps (audit log)'
+    $hit = @(& $sev 'Audit log' @('Critical', 'High'))
+    if ($failed -contains 'Audit log') { & $add $c 'Failed' 'The audit log check errored. Check by hand.' 'Audit logs' }
+    elseif ($hit.Count)                { & $add $c 'Found' "$($hit.Count) suspicious change(s) since $sinceText. See the Audit log findings." 'Audit logs > filter by correlation ID from each finding' }
+    else { & $add $c $(if ($agedOut) { 'Partial' } else { 'Clear' }) "$([int]$st.AuditEvents) role/app events since $sinceText reviewed; none made by a ConnectWise app, from an actor IP, or with an attacker user agent, and no app assigned roles or added credentials.$ageNote" 'Audit logs' }
+
+    # 4. New credentials on any app
+    $c = "Secrets/certificates added to any app since $sinceText"
+    $crit = @(& $sev 'New credentials' @('Critical')); $high = @(& $sev 'New credentials' @('High'))
+    if ($failed -contains 'New secrets and certificates') { & $add $c 'Failed' 'The credential check errored. Check by hand.' 'App registrations > each app > Certificates & secrets' }
+    elseif ($crit.Count) { & $add $c 'Found' "$($crit.Count) added by an app according to the audit log, plus $($high.Count) other(s). See the New credentials findings." 'App registrations > Certificates & secrets' }
+    elseif ($high.Count) { & $add $c 'Review' "$($high.Count) added; confirm your team created each one. See the New credentials findings." 'App registrations > Certificates & secrets' }
+    else { & $add $c 'Clear' 'None added (SAML signing certificate rotations, if any, are listed as Review findings).' '' }
+
+    # 5. Roles held by ConnectWise apps
+    $c = 'ConnectWise/SkyKick apps holding directory roles'
+    $hit = @(& $sev 'Directory roles' @('Critical'))
+    if ($failed -contains 'Directory roles') { & $add $c 'Failed' 'The role check errored. Check by hand.' 'Roles & admins' }
+    elseif ($hit.Count) {
+        $held = foreach ($h in $hit) {
+            $appName = $h.Object -replace ' \([0-9a-f-]{36}\)$', ''
+            $role    = $h.Detail -replace '^ConnectWise/SkyKick app holds (.+?) \(.*$', '$1'
+            "${appName}: $role"
+        }
+        & $add $c 'Action needed' (($held -join '; ') + '. Remove unless you granted it on purpose.') 'Roles & admins > (role) > Assignments'
+    }
+    else { & $add $c 'Clear' 'None.' '' }
+
+    # 6. ConnectWise apps enabled
+    $c = 'ConnectWise/SkyKick apps enabled'
+    if ($failed -contains 'ConnectWise / SkyKick apps') { & $add $c 'Failed' 'The app check errored. Check by hand: Enterprise apps > search SkyKick / ConnectWise.' 'Enterprise apps' }
+    else {
+        $enabled = @($VendorSps.Values | Where-Object { $_.accountEnabled })
+        if ($enabled.Count) { & $add $c 'Action needed' "$($enabled.Count) enabled: $(($enabled | ForEach-Object { $_.displayName }) -join ', '). Disable them (do not delete)." 'Enterprise apps > app > Properties > Enabled for users to sign-in? = No' }
+        elseif ($VendorSps.Count) { & $add $c 'Clear' "$($VendorSps.Count) present, all disabled." '' }
+        else { & $add $c 'Clear' 'None in this tenant.' '' }
+    }
+
+    # 7. Conditional Access exclusions
+    $c = 'Conditional Access exclusions for ConnectWise apps'
+    $hit = @(& $sev 'Conditional Access' @('High'))
+    if ($failed -contains 'Conditional Access') { & $add $c 'Failed' 'The Conditional Access check errored. Check by hand.' 'Conditional Access > Policies' }
+    elseif ($hit.Count) { & $add $c 'Action needed' "$($hit.Count) polic(ies) exclude a ConnectWise app. See the Conditional Access findings." 'Conditional Access > Policies' }
+    else { & $add $c 'Clear' 'None.' '' }
+
+    $rows
+}
+
+function Get-ChecklistVerdict {
+    param($Rows)
+    $found   = @($Rows | Where-Object Status -eq 'Found')
+    $gaps    = @($Rows | Where-Object { $_.Status -in 'Not checked', 'Failed', 'Partial' })
+    $actions = @($Rows | Where-Object { $_.Status -in 'Action needed', 'Review' })
+    if ($found.Count) {
+        $text = "INDICATORS OF COMPROMISE FOUND ($($found.Count) check(s)). Treat this tenant as accessed and work the Critical/High findings."
+        if ($gaps.Count) { $text += ' Also incomplete: ' + (($gaps | ForEach-Object { '{0} ({1})' -f $_.Check, $_.Status.ToLower() }) -join '; ') + '.' }
+        return [pscustomobject]@{ Level = 'Found'; Text = $text }
+    }
+    $text = if ($gaps.Count) { "No indicators found in what could be checked, but $($gaps.Count) check(s) incomplete: $(($gaps | ForEach-Object { "$($_.Check) ($($_.Status.ToLower()))" }) -join '; ')." }
+            else { 'No indicators of compromise found.' }
+    if ($actions.Count) { $text += " $($actions.Count) item(s) still need action." }
+    [pscustomobject]@{ Level = $(if ($gaps.Count) { 'Incomplete' } else { 'Clear' }); Text = $text }
+}
+
+$StatusColors = @{ 'Found' = 'Red'; 'Action needed' = 'Yellow'; 'Review' = 'Cyan'; 'Clear' = 'Green'; 'Not checked' = 'Magenta'; 'Partial' = 'Magenta'; 'Failed' = 'Magenta' }
+
+function Write-ConsoleChecklist {
+    param($Rows, $Verdict)
+    Write-Host ''
+    Write-Host ('-' * 78) -ForegroundColor White
+    Write-Host "IOC CHECKLIST - $($script:Tenant.Name)" -ForegroundColor White
+    Write-Host ('-' * 78) -ForegroundColor White
+    foreach ($r in $Rows) {
+        Write-Host ("  {0,-16}" -f "[$($r.Status.ToUpper())]") -ForegroundColor $StatusColors[$r.Status] -NoNewline
+        Write-Host $r.Check -ForegroundColor White
+        Write-Host "                  $($r.Result)" -ForegroundColor Gray
+    }
+    Write-Host ''
+    $vc = switch ($Verdict.Level) { 'Found' { 'Red' } 'Incomplete' { 'Magenta' } default { 'Green' } }
+    Write-Host "  VERDICT: $($Verdict.Text)" -ForegroundColor $vc
+    Write-Host ('-' * 78) -ForegroundColor White
+}
+
 #region Report
 
 function Write-ConsoleReport {
@@ -941,7 +1083,7 @@ function Write-ConsoleReport {
 }
 
 function Export-HtmlReport {
-    param($Items, $Apps, [string]$Path)
+    param($Items, $Apps, $Checks, $Verdicts, [string]$Path)
     $enc ={ param($s) [System.Net.WebUtility]::HtmlEncode([string]$s) }
     $sb = [System.Text.StringBuilder]::new()
     [void]$sb.Append(@"
@@ -952,6 +1094,8 @@ h1{font-size:22px}h2{font-size:18px;margin-top:32px;border-bottom:1px solid #ccc
 table{border-collapse:collapse;width:100%;font-size:13px}th,td{border:1px solid #ddd;padding:6px;vertical-align:top;text-align:left}
 th{background:#f3f3f3}.Critical{background:#fde2e1}.High{background:#fff4ce}.Review{background:#e6f2fb}.Info{color:#666}
 .sev{font-weight:600;white-space:nowrap}.small{color:#555;font-size:12px}
+.verdict{padding:10px 14px;border-radius:4px;font-weight:600;margin:8px 0 12px}.v-Found{background:#fde2e1;color:#8a1c14}.v-Incomplete{background:#f6e7fb;color:#5c2370}.v-Clear{background:#dff6dd;color:#0e5e0e}
+.st-Found{background:#fde2e1;color:#8a1c14}.st-Action{background:#fff4ce}.st-Review{background:#e6f2fb}.st-Clear{background:#dff6dd;color:#0e5e0e}.st-Gap{background:#f6e7fb;color:#5c2370}
 </style></head><body>
 <h1>ConnectWise Cloud Backup (SkyKick) IOC audit</h1>
 <p class="small">Generated $(Get-Date -Format 'yyyy-MM-dd HH:mm') local. Review window from $(& $enc (Format-Utc $Since)). Read-only; nothing was changed.
@@ -960,7 +1104,18 @@ Source: <a href="https://www.huntress.com/blog/vendor-credential-enables-unautho
     foreach ($t in $Items | Group-Object TenantId) {
         $counts = ($t.Group | Group-Object Severity | Sort-Object { $SeverityOrder[$_.Name] } | ForEach-Object { "$($_.Count) $($_.Name)" }) -join ', '
         [void]$sb.Append("<h2>$(& $enc $t.Group[0].Tenant) <span class='small'>$(& $enc $t.Name) &mdash; $counts</span></h2>")
-        [void]$sb.Append('<table><tr><th>Severity</th><th>Category</th><th>Object</th><th>Detail</th><th>Where to look</th><th>Action</th></tr>')
+        $v = $Verdicts[[string]$t.Name]
+        if ($v) { [void]$sb.Append("<div class='verdict v-$($v.Level)'>$(& $enc $v.Text)</div>") }
+        $tChecks = @($Checks | Where-Object TenantId -eq $t.Name)
+        if ($tChecks) {
+            [void]$sb.Append('<h3>IOC checklist</h3><table><tr><th>Status</th><th>Check</th><th>Result</th><th>Where to look</th></tr>')
+            foreach ($c in $tChecks) {
+                $cls = switch ($c.Status) { 'Found' { 'st-Found' } 'Action needed' { 'st-Action' } 'Review' { 'st-Review' } 'Clear' { 'st-Clear' } default { 'st-Gap' } }
+                [void]$sb.Append("<tr><td class='sev $cls'>$(& $enc $c.Status)</td><td>$(& $enc $c.Check)</td><td>$(& $enc $c.Result)</td><td class='small'>$(& $enc $c.WhereToLook)</td></tr>")
+            }
+            [void]$sb.Append('</table>')
+        }
+        [void]$sb.Append('<h3>Findings</h3><table><tr><th>Severity</th><th>Category</th><th>Object</th><th>Detail</th><th>Where to look</th><th>Action</th></tr>')
         foreach ($f in $t.Group | Sort-Object { $SeverityOrder[$_.Severity] }, Category, When) {
             $where = & $enc $f.WhereToLook
             if ($f.PortalUrl) { $where += "<br><a href='$(& $enc $f.PortalUrl)' target='_blank'>Open in portal</a>" }
@@ -1042,8 +1197,9 @@ try {
     if (-not (Test-Path -LiteralPath $OutputPath)) { New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null }
     $csv  = Join-Path $OutputPath 'Findings.csv'
     $html = Join-Path $OutputPath 'Report.html'
-    $appsCsv = Join-Path $OutputPath 'Apps.csv'
-    foreach ($f in $csv, $appsCsv) { if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f } }   # per-tenant saves append
+    $appsCsv  = Join-Path $OutputPath 'Apps.csv'
+    $checkCsv = Join-Path $OutputPath 'Checklist.csv'
+    foreach ($f in $csv, $appsCsv, $checkCsv) { if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f } }   # per-tenant saves append
 
     $i = 0
     foreach ($t in $tenants) {
@@ -1069,13 +1225,18 @@ try {
                 -Detail "Could not connect: $(Get-ErrorText $_). Check GDAP roles and that Microsoft Graph Command Line Tools is consented in this tenant." `
                 -WhereToLook 'Partner Center > Customers > (customer) > Admin relationships' -PortalUrl ''
             Write-Warning "Could not connect to $($t.Name): $(Get-ErrorText $_)"
+            $row = [pscustomobject]@{ Tenant = $script:Tenant.Name; TenantId = $script:Tenant.Id; Check = 'Sign in to tenant'; Status = 'Failed'; Result = "NOTHING WAS CHECKED. Could not connect: $(Get-ErrorText $_)"; WhereToLook = 'Partner Center > Customers > (customer) > Admin relationships' }
+            $Checklist.Add($row)
+            $Verdicts[[string]$script:Tenant.Id] = [pscustomobject]@{ Name = $script:Tenant.Name; Level = 'Incomplete'; Text = 'NOT AUDITED: could not sign in to this tenant.' }
             $Findings | Where-Object TenantId -eq $script:Tenant.Id | Export-Csv -LiteralPath $csv -NoTypeInformation -Encoding UTF8 -Append
+            $row | Export-Csv -LiteralPath $checkCsv -NoTypeInformation -Encoding UTF8 -Append
             continue
         }
 
         # Each check is independent so one missing permission or license does not stop the rest.
         # The audit log runs before the credential check so new secrets can be tied to who added them.
         $script:AllSps = $null
+        $script:State  = @{}   # what each check saw, for the checklist
         $vendorSps  = Invoke-Check 'ConnectWise / SkyKick apps' { Test-VendorApps }
         if ($vendorSps -isnot [hashtable]) { $vendorSps = @{} }
         Invoke-Check 'Directory roles' { Test-RoleAssignments -VendorSps $vendorSps } | Out-Null
@@ -1112,7 +1273,15 @@ try {
             }
         }
 
+        # The checklist goes last so it is what's on screen when the tenant finishes
+        $tenantChecks = @(Get-TenantChecklist -VendorSps $vendorSps -TenantFindings $tenantFindings)
+        $verdict = Get-ChecklistVerdict $tenantChecks
+        foreach ($r in $tenantChecks) { $Checklist.Add($r) }
+        $Verdicts[[string]$script:Tenant.Id] = [pscustomobject]@{ Name = $script:Tenant.Name; Level = $verdict.Level; Text = $verdict.Text }
+        Write-ConsoleChecklist $tenantChecks $verdict
+
         # Saved per tenant so stopping a long multi-tenant run keeps what is already done
+        $tenantChecks | Export-Csv -LiteralPath $checkCsv -NoTypeInformation -Encoding UTF8 -Append
         $tenantFindings | Sort-Object { $SeverityOrder[$_.Severity] }, Category, When |
             Export-Csv -LiteralPath $csv -NoTypeInformation -Encoding UTF8 -Append
         if ($tenantApps) { $tenantApps | Export-Csv -LiteralPath $appsCsv -NoTypeInformation -Encoding UTF8 -Append }
@@ -1126,23 +1295,20 @@ try {
     $sorted | Export-Csv -LiteralPath $csv -NoTypeInformation -Encoding UTF8
     $sortedApps = $AppInventory | Sort-Object Tenant, { -not $_.HighRiskPermissions }, App
     if ($sortedApps) { $sortedApps | Export-Csv -LiteralPath $appsCsv -NoTypeInformation -Encoding UTF8 }
-    Export-HtmlReport -Items $sorted -Apps $sortedApps -Path $html
+    Export-HtmlReport -Items $sorted -Apps $sortedApps -Checks $Checklist -Verdicts $Verdicts -Path $html
 
     Write-Host ''
     Write-Host ("=" * 78) -ForegroundColor DarkGray
-    Write-Host 'Tenants with Critical or High findings:' -ForegroundColor White
-    $flagged = $Findings | Where-Object { $_.Severity -in 'Critical', 'High' } | Group-Object Tenant
-    if ($flagged) {
-        foreach ($g in $flagged) {
-            $c = @($g.Group | Where-Object Severity -eq 'Critical').Count
-            $h = @($g.Group | Where-Object Severity -eq 'High').Count
-            Write-Host ("  {0}: {1} Critical, {2} High" -f $g.Name, $c, $h) -ForegroundColor $(if ($c) { 'Red' } else { 'Yellow' })
-        }
-    } else { Write-Host '  None' -ForegroundColor Green }
+    Write-Host 'Verdict by tenant:' -ForegroundColor White
+    foreach ($v in $Verdicts.Values) {
+        $vc = switch ($v.Level) { 'Found' { 'Red' } 'Incomplete' { 'Magenta' } default { 'Green' } }
+        Write-Host "  $($v.Name): $($v.Text)" -ForegroundColor $vc
+    }
     Write-Host ''
-    Write-Host "Findings: $csv"
-    if ($sortedApps) { Write-Host "Apps:     $appsCsv" }
-    Write-Host "Report:   $html"
+    Write-Host "Checklist: $checkCsv"
+    Write-Host "Findings:  $csv"
+    if ($sortedApps) { Write-Host "Apps:      $appsCsv" }
+    Write-Host "Report:    $html"
     exit 0
 } catch {
     Write-Error "Audit failed: $(Get-ErrorText $_)"
