@@ -499,13 +499,22 @@ function Remove-ProfileOneDriveLeftovers {
         }
     }
 
+    # -User does not accept Entra ID SIDs (S-1-12-1-*: "No valid SID could be determined"), so the package is found by
+    # listing it for all users and filtering on the SID. For an Entra ID user it is then left to the all-users removal
+    # in the machine-wide section, which runs whenever no profile was skipped.
     try {
-        Get-AppxPackage -Name 'Microsoft.OneDriveSync' -User $UserProfile.Sid -ErrorAction Stop | ForEach-Object {
-            $Package = $_
-            Invoke-Change "Remove package $($Package.PackageFullName) for $Label" {
-                Remove-AppxPackage -Package $Package.PackageFullName -User $UserProfile.Sid -ErrorAction Stop
+        Get-AppxPackage -AllUsers -Name 'Microsoft.OneDriveSync' -ErrorAction Stop |
+            Where-Object { @($_.PackageUserInformation | ForEach-Object { $_.UserSecurityId.Sid }) -contains $UserProfile.Sid } |
+            ForEach-Object {
+                $Package = $_
+                if ($UserProfile.Sid -like 'S-1-12-1-*') {
+                    Write-Log "Package $($Package.PackageFullName) for $Label will be removed with the all-users package removal."
+                    return
+                }
+                Invoke-Change "Remove package $($Package.PackageFullName) for $Label" {
+                    Remove-AppxPackage -Package $Package.PackageFullName -User $UserProfile.Sid -ErrorAction Stop
+                }
             }
-        }
     } catch {
         Write-Log "Could not query AppX packages for ${Label}: $($_.Exception.Message)" -Level Warning
     }
@@ -566,11 +575,13 @@ try {
         }
 
         $State = Get-ProfileOneDriveState -UserProfile $UserProfile -HiveRoot $HiveRoot
-        $HasOneDrive = $State.PerUserInstall -or ($HasMachineInstall -and $State.Accounts.Count -gt 0)
+        # A per-machine install can run for every profile, signed in to an account yet or not.
+        $HasOneDrive = $State.PerUserInstall -or $HasMachineInstall
         $SignedIn = $SignedInSids -contains $UserProfile.Sid
 
-        $Summary = "$($UserProfile.Label): " + $(if ($State.PerUserInstall) { 'per-user install' } elseif ($HasOneDrive) { 'uses per-machine install' } else { 'OneDrive not installed' })
-        $Summary += $(if ($SignedIn) { ', signed in' } else { ', not signed in' })
+        $Summary = "$($UserProfile.Label): " + $(if ($State.PerUserInstall) { 'per-user install' } elseif ($HasMachineInstall) { 'per-machine install' } else { 'OneDrive not installed' })
+        if ($HasOneDrive -and $State.Accounts.Count -eq 0) { $Summary += ', no OneDrive account signed in' }
+        $Summary += $(if ($SignedIn) { ', signed in to Windows' } else { ', not signed in to Windows' })
         foreach ($Account in $State.Accounts) {
             $Summary += "; account '$($Account.Name)'$(if ($Account.Email) { " ($($Account.Email))" }) syncs to $($Account.UserFolder)"
         }
@@ -663,6 +674,18 @@ try {
                     Unregister-ScheduledTask -TaskName $Task.TaskName -TaskPath $Task.TaskPath -Confirm:$false -ErrorAction Stop
                 }
             }
+
+        # Catches Entra ID users (see Remove-ProfileOneDriveLeftovers) and packages left by profiles that no longer exist.
+        try {
+            Get-AppxPackage -AllUsers -Name 'Microsoft.OneDriveSync' -ErrorAction Stop | ForEach-Object {
+                $Package = $_
+                Invoke-Change "Remove package $($Package.PackageFullName) for all users" {
+                    Remove-AppxPackage -Package $Package.PackageFullName -AllUsers -ErrorAction Stop
+                }
+            }
+        } catch {
+            Write-Log "Could not query AppX packages for all users: $($_.Exception.Message)" -Level Warning
+        }
 
         try {
             Get-AppxProvisionedPackage -Online -ErrorAction Stop | Where-Object { $_.DisplayName -eq 'Microsoft.OneDriveSync' } | ForEach-Object {

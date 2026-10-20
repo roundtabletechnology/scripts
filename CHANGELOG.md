@@ -2,6 +2,14 @@
 
 All notable changes to this repository are documented here. Entries are grouped by date where commit history allows, otherwise by theme.
 
+## 2026-10-20
+
+### Windows/Applications - Uninstall OneDrive (fixes from the first NinjaOne dry runs)
+
+- **Entra ID users' `Microsoft.OneDriveSync` package was never removed.** `Get-AppxPackage -User` rejects Entra ID SIDs (`S-1-12-1-*`) with "No valid SID could be determined", so on a cloud-only device the per-user package query failed outright. The package is now found by listing it for all users and filtering `PackageUserInformation` on the SID (confirmed elevated that the SID filter matches the right user). Entra ID users' packages are then removed by a new all-users removal (`Remove-AppxPackage -AllUsers`) in the machine-wide step, which also catches packages left by deleted profiles. Like the rest of that step, it is held back when a profile is skipped for Known Folder Move.
+- **With a per-machine install, a user with no OneDrive account was reported as "OneDrive not installed"** even though the removal then ran for them. Each profile now reports `per-machine install`, plus `no OneDrive account signed in` when there is none, and the Windows sign-in state is worded as such.
+- **Known Folder Move check widened for per-machine installs.** It previously applied only to users with a OneDrive account configured. A per-machine install can run for any profile, so the check now covers every profile on such a machine.
+
 ## 2026-10-19
 
 ### Microsoft 365/Security and Compliance - Audit ConnectWise SkyKick IOCs (new script, not yet run against a real tenant)
