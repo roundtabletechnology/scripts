@@ -42,7 +42,7 @@ See [HOWTO.md](../HOWTO.md) for guidance on downloading and running scripts.
 | [Create Admin User.sh](OS/Create%20Admin%20User.sh) | Creates a local administrator account on macOS |
 | [Create Desktop Shortcut.sh](OS/Create%20Desktop%20Shortcut.sh) | Creates a URL shortcut on the user's Desktop |
 | [Get Apple IDs.sh](OS/Get%20Apple%20IDs.sh) | Reports Apple IDs associated with accounts on the device |
-| [Get Installed Printers.sh](OS/Get%20Installed%20Printers.sh) | Lists installed printers (name and device URI), skipping fax/PDF/OneNote queues; reports to NinjaOne `printers` field |
+| [Get Installed Printers.sh](OS/Get%20Installed%20Printers.sh) | Lists installed printers (name and device URI), skipping fax/PDF/OneNote/NinjaRemote queues; reports to NinjaOne `printers` field |
 | [Set User Password.sh](OS/Set%20User%20Password.sh) | Sets the password for a specified local user account |
 
 ### Security

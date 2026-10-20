@@ -1,8 +1,9 @@
 #!/bin/bash
 # Get installed printers [MAC]
 # Lists the printers installed on the Mac (name and device URI - the macOS
-# equivalent of a Windows port), skipping fax, PDF and OneNote queues, prints
-# them to stdout, and publishes them to the Ninja RMM custom field "printers".
+# equivalent of a Windows port), skipping fax, PDF, OneNote and NinjaRemote
+# queues, prints them to stdout, and publishes them to the Ninja RMM custom
+# field "printers".
 
 # Configuration
 NINJA_CUSTOM_FIELD="printers"
@@ -20,6 +21,9 @@ while IFS= read -r line; do
     rest="${line#device for }"
     queue="${rest%%: *}"
     uri="${rest#*: }"
+
+    # Skip the NinjaRemote virtual printer that the Ninja agent installs
+    [[ "$uri" == nrprinter:* ]] && continue
 
     # Use the friendly name shown in System Settings; fall back to the queue name
     name=$(lpstat -l -p "$queue" 2>/dev/null | awk -F'Description: ' '/Description: /{print $2; exit}')
