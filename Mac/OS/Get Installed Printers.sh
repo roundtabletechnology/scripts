@@ -8,7 +8,7 @@
 # Configuration
 NINJA_CUSTOM_FIELD="printers"
 NINJA_CLI="/Applications/NinjaRMMAgent/programdata/ninjarmm-cli"
-EXCLUDE_PATTERN="fax|pdf|onenote"   # Matched case-insensitively against name and queue
+EXCLUDE_PATTERN="fax|pdf|onenote|ninjaremote"   # Matched case-insensitively against name and queue
 
 # lpstat's "device for" wording is localized; force English so parsing works
 export LC_ALL=C
@@ -21,9 +21,6 @@ while IFS= read -r line; do
     rest="${line#device for }"
     queue="${rest%%: *}"
     uri="${rest#*: }"
-
-    # Skip the NinjaRemote virtual printer that the Ninja agent installs
-    [[ "$uri" == nrprinter:* ]] && continue
 
     # Use the friendly name shown in System Settings; fall back to the queue name
     name=$(lpstat -l -p "$queue" 2>/dev/null | awk -F'Description: ' '/Description: /{print $2; exit}')
