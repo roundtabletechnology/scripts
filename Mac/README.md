@@ -31,6 +31,7 @@ See [HOWTO.md](../HOWTO.md) for guidance on downloading and running scripts.
 | [Install BitDefender GravityZone.sh](Applications/Install%20BitDefender%20GravityZone.sh) | Installs the BitDefender GravityZone endpoint agent on macOS |
 | [Install ConnectSecure Agent.sh](Applications/Install%20ConnectSecure%20Agent.sh) | Installs the ConnectSecure (CyberCNS) vulnerability scanning agent on macOS |
 | [Install Huntress Agent.sh](Applications/Install%20Huntress%20Agent.sh) | Installs the Huntress agent on macOS via NinjaOne |
+| [Install NordLayer.sh](Applications/Install%20NordLayer.sh) | Installs NordLayer VPN with the org ID from NinjaOne `nordlayerorgid` and appends trusted Wi-Fi networks from `NordTrustedNetworks` |
 | [Uninstall OneDrive.sh](Applications/Uninstall%20OneDrive.sh) | Silently removes OneDrive and blocks a reinstalled copy from syncing; never touches synced files, skips the Mac if any user has Folder Backup |
 | [Uninstall Webroot.sh](Applications/Uninstall%20Webroot.sh) | Removes the Webroot SecureAnywhere agent from macOS |
 
