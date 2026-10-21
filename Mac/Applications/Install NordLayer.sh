@@ -12,6 +12,8 @@
 # Notes:
 # - The org ID is set as an extended attribute on the .pkg and only applies to a
 #   first-time install, so it is skipped when NordLayer is already installed.
+# - Both custom fields are optional: if either is empty (or ninjarmm-cli is
+#   missing), NordLayer still installs and that step is skipped.
 # - SettingsConfig.plist lives in a per-user sandbox container. NordLayer reads
 #   it at launch and every 5 minutes, applies it, then deletes it. If a user's
 #   container doesn't exist yet (app never launched), the app is launched for
@@ -34,13 +36,14 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-if [[ ! -x "$NINJA_CLI" ]]; then
-    echo "Error: ninjarmm-cli not found at $NINJA_CLI"
-    exit 1
+org_id=""
+trusted_raw=""
+if [[ -x "$NINJA_CLI" ]]; then
+    org_id=$("$NINJA_CLI" get "$ORG_ID_FIELD" 2>/dev/null | tr -d '[:space:]')
+    trusted_raw=$("$NINJA_CLI" get "$TRUSTED_NETWORKS_FIELD" 2>/dev/null)
+else
+    echo "Warning: ninjarmm-cli not found at $NINJA_CLI - installing without org ID or trusted networks."
 fi
-
-org_id=$("$NINJA_CLI" get "$ORG_ID_FIELD" 2>/dev/null | tr -d '[:space:]')
-trusted_raw=$("$NINJA_CLI" get "$TRUSTED_NETWORKS_FIELD" 2>/dev/null)
 
 # Split the comma-separated SSIDs into an array, trimming surrounding whitespace
 trusted_networks=()
@@ -55,11 +58,6 @@ done
 if [[ -d "$APP_PATH" ]]; then
     echo "NordLayer already installed - skipping install (org ID only applies to a first-time install)."
 else
-    if [[ -z "$org_id" ]]; then
-        echo "Error: Ninja custom field '$ORG_ID_FIELD' is empty."
-        exit 1
-    fi
-
     work_dir=$(mktemp -d)
     trap 'rm -rf "$work_dir"' EXIT
     pkg="$work_dir/NordLayer.pkg"
@@ -75,11 +73,13 @@ else
         exit 1
     fi
 
-    if ! xattr -w com.nordlayer.organization_id "$org_id" "$pkg"; then
-        echo "Error: failed to set organization ID on the package."
-        exit 1
+    if [[ -z "$org_id" ]]; then
+        echo "Warning: Ninja custom field '$ORG_ID_FIELD' is empty - installing without a preset organization ID."
+    elif xattr -w com.nordlayer.organization_id "$org_id" "$pkg"; then
+        echo "Preset organization ID: $org_id"
+    else
+        echo "Warning: failed to set organization ID on the package - installing without it."
     fi
-    echo "Preset organization ID: $org_id"
 
     echo "Installing NordLayer..."
     if ! installer -pkg "$pkg" -target / ; then
