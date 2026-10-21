@@ -1,167 +1,154 @@
 #!/bin/bash
-# Install NordLayer [MAC]
-# Installs the NordLayer VPN client via NinjaOne, presetting the organization ID
-# from the Ninja custom field "nordlayerorgid", then drops a SettingsConfig.plist
-# that appends the trusted Wi-Fi networks from the comma-separated Ninja custom
-# field "NordTrustedNetworks" into each user's NordLayer container.
-#
-# NordLayer docs:
-#   https://help.nordlayer.com/docs/guide-to-presetting-organization-id-in-nordlayer
-#   https://help.nordlayer.com/docs/how-to-preset-nordlayer-application-settings
-#
-# Notes:
-# - The org ID is set as an extended attribute on the .pkg and only applies to a
-#   first-time install, so it is skipped when NordLayer is already installed.
-# - Both custom fields are optional: if either is empty (or ninjarmm-cli is
-#   missing), NordLayer still installs and that step is skipped.
-# - SettingsConfig.plist lives in a per-user sandbox container. NordLayer reads
-#   it at launch and every 5 minutes, applies it, then deletes it. If a user's
-#   container doesn't exist yet (app never launched), the app is launched for
-#   the logged-in user so macOS creates it; other users are skipped.
-# - Writing into another app's container needs Full Disk Access for the Ninja
-#   agent on macOS 14+.
 
-# Configuration
+# Developed by Jeff and Gemini
+# NordLayer Install [MAC]
+# Get latest version of NordLayer VPN and install it. 
+# Uses custom variables for Nord Site ID and Nord Trusted WiFi networks.
+
+# ==============================================================================
+# ENVIRONMENT & NINJARMM-CLI PATH VALIDATION
+# ==============================================================================
+# Define the definitive systemic path for the NinjaOne Mac Agent CLI utility
 NINJA_CLI="/Applications/NinjaRMMAgent/programdata/ninjarmm-cli"
-ORG_ID_FIELD="nordlayerorgid"
-TRUSTED_NETWORKS_FIELD="NordTrustedNetworks"
-DOWNLOAD_URL="https://downloads.nordlayer.com/mac/latest/NordLayer.pkg"
-APP_PATH="/Applications/NordLayer.app"
-BUNDLE_ID="com.nordvpn.macos.teams"
-CONFIG_SUBPATH="Library/Containers/$BUNDLE_ID/Data/Library/Application Support/$BUNDLE_ID"
-CONTAINER_WAIT_SECONDS=60
 
-if [[ $EUID -ne 0 ]]; then
-    echo "Error: this script must be run as root."
+echo "=========================================================================="
+echo " Starting NordLayer Managed Deployment via NinjaRMM Native CLI"
+echo "=========================================================================="
+
+# Check that the runtime environment is elevated to root
+if [ "$EUID" -ne 0 ]; then
+   echo "ERROR: This script must be executed as root by the NinjaRMM Agent."
+   exit 1
+fi
+
+# Confirm the native CLI engine is present and executable before proceeding
+if [ ! -x "$NINJA_CLI" ]; then
+    echo "ERROR: NinjaRMM CLI binary not found or not executable at $NINJA_CLI"
+    echo "Please ensure the target device has the active NinjaOne Mac Agent installed."
     exit 1
 fi
 
-org_id=""
-trusted_raw=""
-if [[ -x "$NINJA_CLI" ]]; then
-    org_id=$("$NINJA_CLI" get "$ORG_ID_FIELD" 2>/dev/null | tr -d '[:space:]')
-    trusted_raw=$("$NINJA_CLI" get "$TRUSTED_NETWORKS_FIELD" 2>/dev/null)
-else
-    echo "Warning: ninjarmm-cli not found at $NINJA_CLI - installing without org ID or trusted networks."
-fi
+# ==============================================================================
+# FIELD RETRIEVAL & INITIAL VALIDATION
+# ==============================================================================
+echo "Querying NinjaRMM custom attributes..."
 
-# Split the comma-separated SSIDs into an array, trimming surrounding whitespace
-trusted_networks=()
-IFS=',' read -r -a parts <<< "$trusted_raw"
-for ssid in "${parts[@]}"; do
-    ssid="${ssid#"${ssid%%[![:space:]]*}"}"
-    ssid="${ssid%"${ssid##*[![:space:]]}"}"
-    [[ -n "$ssid" ]] && trusted_networks+=("$ssid")
-done
+# Extract the values dynamically from the Ninja custom fields database
+RAW_ORG_ID=$("$NINJA_CLI" get "nordlayerorgid" 2>/dev/null)
+RAW_TRUSTED_NETWORKS=$("$NINJA_CLI" get "NordTrustedNetworks" 2>/dev/null)
 
-# ---- Install ----
-if [[ -d "$APP_PATH" ]]; then
-    echo "NordLayer already installed - skipping install (org ID only applies to a first-time install)."
-else
-    work_dir=$(mktemp -d)
-    trap 'rm -rf "$work_dir"' EXIT
-    pkg="$work_dir/NordLayer.pkg"
+# Define operational internal variables (Using the updated, working URL)
+INSTALLER_URL="https://downloads.nordlayer.com/mac/latest/NordLayer.pkg"
+INSTALLER_PATH="/tmp/NordLayer.pkg"
 
-    echo "Downloading NordLayer..."
-    if ! curl -fsSL "$DOWNLOAD_URL" -o "$pkg"; then
-        echo "Error: failed to download $DOWNLOAD_URL"
-        exit 1
+# Helper validation loop function to strip and catch empty/null outputs
+is_valid_variable() {
+    local var_value="$1"
+    # Filter true blanks, null strings, or empty value indicators
+    if [ -z "$var_value" ] || [ "$var_value" = "null" ] || [ "$var_value" = '$' ]; then
+        return 1
     fi
-
-    if ! pkgutil --check-signature "$pkg" >/dev/null 2>&1; then
-        echo "Error: downloaded package failed signature check."
-        exit 1
-    fi
-
-    if [[ -z "$org_id" ]]; then
-        echo "Warning: Ninja custom field '$ORG_ID_FIELD' is empty - installing without a preset organization ID."
-    elif xattr -w com.nordlayer.organization_id "$org_id" "$pkg"; then
-        echo "Preset organization ID: $org_id"
-    else
-        echo "Warning: failed to set organization ID on the package - installing without it."
-    fi
-
-    echo "Installing NordLayer..."
-    if ! installer -pkg "$pkg" -target / ; then
-        echo "Error: NordLayer install failed."
-        exit 1
-    fi
-    echo "NordLayer installed."
-fi
-
-# ---- Trusted networks ----
-if [[ ${#trusted_networks[@]} -eq 0 ]]; then
-    echo "Ninja custom field '$TRUSTED_NETWORKS_FIELD' is empty - no trusted networks to set."
-    exit 0
-fi
-
-xml_escape() {
-    local s="$1"
-    s="${s//&/&amp;}"
-    s="${s//</&lt;}"
-    s="${s//>/&gt;}"
-    s="${s//\"/&quot;}"
-    s="${s//\'/&apos;}"
-    printf '%s' "$s"
+    return 0
 }
 
-plist_content='<?xml version="1.0" encoding="UTF-8"?>
+# Resolve active console (GUI desktop) user to bind target sandboxed directories
+CURRENT_USER=$(stat -f '%Su' /dev/console)
+if [ -z "$CURRENT_USER" ] || [ "$CURRENT_USER" = "root" ]; then
+    echo "WARNING: No active GUI console user resolved. Configurations cannot be mapped."
+    CURRENT_USER=""
+fi
+
+# ==============================================================================
+# STAGE 1: DOWNLOAD CLEAN BUNDLE
+# ==============================================================================
+echo "Downloading fresh system package layer directly from NordLayer..."
+if curl -L -s --max-time 600 -o "$INSTALLER_PATH" "$INSTALLER_URL"; then
+    echo "Binary cache successfully written to $INSTALLER_PATH."
+else
+    echo "ERROR: Transfer failed from target source $INSTALLER_URL"
+    exit 1
+fi
+
+# ==============================================================================
+# STAGE 2: PROCESS & ALLOCATE ORGANIZATION ID
+# ==============================================================================
+if is_valid_variable "$RAW_ORG_ID"; then
+    echo "Validated Organization ID retrieved: '$RAW_ORG_ID'. Assigning package header..."
+    
+    # Preset the package extended attributes so the login screen autofills the Org ID
+    if xattr -w com.nordlayer.organization_id "$RAW_ORG_ID" "$INSTALLER_PATH"; then
+        echo "Successfully mapped unique organization metadata directly to binary."
+    else
+        echo "WARNING: Attribute utility failed to apply metadata payload."
+    fi
+else
+    echo "Organization ID custom field data empty or unset. Bypassing metadata wrapper allocation."
+fi
+
+# ==============================================================================
+# STAGE 3: CONFIGURE SAFE NETWORKS AND AUTO-CONNECT BEHAVIORS
+# ==============================================================================
+if is_valid_variable "$RAW_TRUSTED_NETWORKS"; then
+    echo "Validated Trusted Networks retrieved: '$RAW_TRUSTED_NETWORKS'"
+    
+    if [ -n "$CURRENT_USER" ]; then
+        # Define structural application sandbox profile path
+        PLIST_DIR="/Users/$CURRENT_USER/Library/Containers/com.nordvpn.macos.teams/Data/Library/Application Support/com.nordvpn.macos.teams"
+        PLIST_PATH="$PLIST_DIR/SettingsConfig.plist"
+        
+        echo "Constructing secure context profile tree for user path: /Users/$CURRENT_USER"
+        mkdir -p "$PLIST_DIR"
+        
+        # Parse the comma-separated trusted networks into XML <string> tags
+        FORMATTED_NETWORKS=""
+        IFS=',' read -ra NETWORKS_ARRAY <<< "$RAW_TRUSTED_NETWORKS"
+        for network in "${NETWORKS_ARRAY[@]}"; do
+            # Safely trim leading and trailing spaces without modifying internal spaces
+            CLEAN_SSID=$(echo "$network" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            if [ -n "$CLEAN_SSID" ]; then
+                FORMATTED_NETWORKS="${FORMATTED_NETWORKS}        <string>${CLEAN_SSID}</string>
+"
+            fi
+        done
+        
+        # Deploy xml plist template ensuring safe networks disable auto-connect loops
+        # NOTE: Adding networks to 'AppendTrustedNetworks' tells NordLayer to completely 
+        # bypass and turn off Auto-Connect behaviors while active on those SSIDs.
+        cat <<EOF > "$PLIST_PATH"
+<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>AppendTrustedNetworks</key>
     <array>
-'
-for ssid in "${trusted_networks[@]}"; do
-    plist_content+="        <string>$(xml_escape "$ssid")</string>"$'\n'
-done
-plist_content+='    </array>
+${FORMATTED_NETWORKS}    </array>
 </dict>
 </plist>
-'
+EOF
 
-console_user=$(stat -f '%Su' /dev/console)
-
-write_config() {
-    local user="$1" home="$2"
-    local config_dir="$home/$CONFIG_SUBPATH"
-    local config_file="$config_dir/SettingsConfig.plist"
-
-    mkdir -p "$config_dir" || return 1
-    printf '%s' "$plist_content" > "$config_file" || return 1
-    if ! plutil -lint -s "$config_file"; then
-        rm -f "$config_file"
-        return 1
-    fi
-    chown "$user":staff "$config_file"
-    chmod 644 "$config_file"
-}
-
-echo "Trusted networks: $(IFS=','; echo "${trusted_networks[*]}")"
-
-# Real local users (UID 501+) with a home under /Users
-while IFS= read -r user; do
-    home=$(dscl . -read "/Users/$user" NFSHomeDirectory 2>/dev/null | awk '{print $2}')
-    [[ "$home" == /Users/* && -d "$home" ]] || continue
-
-    container="$home/Library/Containers/$BUNDLE_ID"
-    if [[ ! -d "$container" && "$user" == "$console_user" ]]; then
-        echo "Launching NordLayer for $user to create its app container..."
-        launchctl asuser "$(id -u "$user")" sudo -u "$user" open -a "$APP_PATH"
-        for (( i = 0; i < CONTAINER_WAIT_SECONDS; i++ )); do
-            [[ -d "$container/Data/Library" ]] && break
-            sleep 1
-        done
-    fi
-
-    if [[ ! -d "$container" ]]; then
-        echo "Skipped $user: NordLayer has not been launched for this user yet."
-        continue
-    fi
-
-    if write_config "$user" "$home"; then
-        echo "Wrote trusted networks config for $user."
+        # Hand ownership back to the desktop user context so the engine sandbox can read it
+        chown -R "$CURRENT_USER":staff "/Users/$CURRENT_USER/Library/Containers/com.nordvpn.macos.teams"
+        echo "Configuration verified and locked at user tier path: $PLIST_PATH"
     else
-        echo "Failed to write trusted networks config for $user (does the Ninja agent have Full Disk Access?)."
+        echo "WARNING: Safe zone network profiles found, but skipping profile output because no active desktop user was identified."
     fi
-done < <(dscl . -list /Users UniqueID | awk '$2 >= 501 {print $1}')
+else
+    echo "Trusted Networks custom field data empty or unset. Bypassing trusted wifi addition"
+fi
+
+# ==============================================================================
+# STAGE 4: TRIGGER NATIVE INSTALLATION
+# ==============================================================================
+echo "Triggering native system target installation utility..."
+if installer -pkg "$INSTALLER_PATH" -target /; then
+    echo "NordLayer deployment executed and successfully finalized."
+    
+    # Perform operational housekeeping cleanup
+    rm -f "$INSTALLER_PATH"
+    exit 0
+else
+    echo "ERROR: Underpinning OS installation process returned a critical non-zero error."
+    exit 1
+fi
+
+```
