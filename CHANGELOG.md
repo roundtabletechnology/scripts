@@ -2,6 +2,19 @@
 
 All notable changes to this repository are documented here. Entries are grouped by date where commit history allows, otherwise by theme.
 
+## 2026-10-29
+
+### Misc - Audit Password Strength (new script)
+
+Offline password audit (Python 3, standard library only, no network calls). Input is a hidden interactive prompt, piped lines, a plain list (one per line), or a CSV/TSV with the password column picked by `--column` (name or index; auto-detected when the header looks like "password").
+
+- **Standards, current as of October 2026:** NIST SP 800-63B-4 (password-only >= 15, with MFA >= 8, whole password not on a blocklist of common/breached/dictionary/context words; NFC normalized, code points counted); CIS Password Policy Guide (14 / 8); PCI DSS v4.0.1 8.3.6 (>= 12, letters and digits); OWASP ASVS 5.0 V6.2 L2 (>= 8, common/context/breached). Legacy Windows complexity is reported for information only, since NIST and ASVS now prohibit composition rules. A "BEST" column adds no weakness findings and >= 65 estimated bits on top of NIST password-only.
+- **Strength estimate:** pattern-aware like zxcvbn (dictionary words, leetspeak, keyboard walks, sequences, repeats, years and dates), with a rating and an estimated offline crack time on a fast hash.
+- **Findings:** exact blocklist hits, common words with trivial changes (`P@ssw0rd123!`, `Summer2026!`), context words (from `--user-column` and `--context`), all-pattern passwords, and passwords reused within the list.
+- **Blocklists:** a small built-in list is always used. `--wordlist` streams any size of plaintext list, and `--hibp` reads an offline HIBP Pwned Passwords SHA-1 download (single sorted file via binary search, or the split prefix directory).
+- Passwords and matched fragments are masked unless `--show-passwords` is given. `--output` writes CSV or JSON. Exit code 0 when all pass `--standard` (default `nist`), 2 when any fail, 1 on error.
+- Tested against sample lists, CSVs, piped input, both HIBP layouts and the error paths. The interactive prompt was not run here because there was no terminal to test it in.
+
 ## 2026-10-20
 
 ### Windows/Applications - Uninstall OneDrive (fixes from the first NinjaOne dry runs)
