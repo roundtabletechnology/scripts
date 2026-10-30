@@ -276,7 +276,7 @@ while IFS='#' read -r name type regex paths; do
     if [[ "$type" == "Own" && "$PRE_ONBOARDING_MODE" -eq 1 ]]; then type="RMM"; fi
 
     block="  - ${name} [${state}]"$'\n'"$(echo "$evidence" | sed 's/^/      /')"$'\n'
-    label="$name"; [[ "$state" == "Installed" ]] && label="$name (inactive)"
+    label="$name"
 
     case "$type" in
         RMM)    RMM_BLOCK="${RMM_BLOCK}${block}";       RMM_NAMES="${RMM_NAMES:+$RMM_NAMES, }${label}";       RMM_COUNT=$((RMM_COUNT + 1)) ;;
@@ -302,9 +302,10 @@ if [[ "$RMM_COUNT" -eq 0 && "$REMOTE_COUNT" -eq 0 ]]; then
     echo "No competing RMM agents or remote access tools detected."
 fi
 
+# Field value: a plain comma separated list of product names (RMM agents first)
 RESULT=""
-[[ "$RMM_COUNT" -gt 0 ]]    && RESULT="RMM: ${RMM_NAMES}"
-[[ "$REMOTE_COUNT" -gt 0 ]] && RESULT="${RESULT:+$RESULT | }Remote access: ${REMOTE_NAMES}"
+[[ "$RMM_COUNT" -gt 0 ]]    && RESULT="${RMM_NAMES}"
+[[ "$REMOTE_COUNT" -gt 0 ]] && RESULT="${RESULT:+$RESULT, }${REMOTE_NAMES}"
 [[ -z "$RESULT" ]] && RESULT="None detected"
 
 echo "------------------------------------------------------------"

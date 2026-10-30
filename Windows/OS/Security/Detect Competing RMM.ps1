@@ -395,10 +395,9 @@ try {
         Write-Host 'No competing RMM agents or remote access tools detected.'
     }
 
-    $parts = @()
-    if ($rmm.Count -gt 0)    { $parts += 'RMM: ' + (($rmm | ForEach-Object { if ($_.State -eq 'Installed') { "$($_.Name) (inactive)" } else { $_.Name } }) -join ', ') }
-    if ($remote.Count -gt 0) { $parts += 'Remote access: ' + (($remote | ForEach-Object { if ($_.State -eq 'Installed') { "$($_.Name) (inactive)" } else { $_.Name } }) -join ', ') }
-    $result = if ($parts.Count -gt 0) { $parts -join ' | ' } else { 'None detected' }
+    # Field value: a plain comma separated list of product names (RMM agents first)
+    $names  = @(@($rmm) + @($remote) | ForEach-Object { $_.Name })
+    $result = if ($names.Count -gt 0) { $names -join ', ' } else { 'None detected' }
 
     Write-Host '------------------------------------------------------------'
     Write-Host "Reported value: $result"
