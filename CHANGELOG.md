@@ -2,6 +2,20 @@
 
 All notable changes to this repository are documented here. Entries are grouped by date where commit history allows, otherwise by theme.
 
+## 2026-10-30
+
+### Windows/OS/Security and Mac/Security - Detect Competing RMM (new scripts)
+
+Finds other MSPs' management agents and remote access tools on a device, because a NinjaOne agent cannot be installed by more than one MSP and a leftover agent is the usual reason an onboarding fails or a device is still managed by someone else. Read-only; changes nothing.
+
+- **Catalog of about 40 RMM platforms and 30 remote access tools**, built from vendor knowledge and the [LOLRMM](https://lolrmm.io) catalog (358 entries). RMM: ConnectWise Automate and RMM (Continuum), Datto RMM, Kaseya VSA, N-able N-central and RMM, Atera, Syncro, SuperOps, Pulseway, Level, Action1, ManageEngine, Tactical RMM, Addigy (Mac), KACE, Itarian and others. Remote access: ScreenConnect, AnyDesk, TeamViewer, Splashtop, LogMeIn/GoTo, RustDesk, Zoho Assist, BeyondTrust, Take Control, MeshCentral, SimpleHelp, VNC, NoMachine and others.
+- **Two tiers.** `RMM` is a conflict to resolve; `Remote access` is a review item, since a client's own TeamViewer is often legitimate. Each product is `Active` (service or process running) or `Installed` (files, uninstall entry or stopped service only). The result goes to the NinjaOne field `competingRmm` (`RMM: ... | Remote access: ...`, or `None detected`).
+- **Evidence.** Windows: uninstall keys (both views and loaded user hives), services, processes, install paths, and per-user folders under every profile for portable installs. Mac: app bundles, launchd jobs for the system and every user, pkg receipts, processes and install folders.
+- **NinjaOne itself is informational**, because the script normally runs from it. `-PreOnboarding` / `--pre-onboarding` (env `PRE_ONBOARDING`) treats a NinjaOne agent as another MSP's, for scanning a device that is not under your instance yet.
+- **`-Ignore` / `--ignore` (env `IGNORE_PRODUCTS`)** skips tools the company uses itself. `-FailOnDetect` / `--fail-on-detect` exits 2 when a competing RMM is found, for use as a NinjaOne condition.
+- Tested on Windows 11 under PowerShell 7 and 5.1 against a real machine plus planted fake agent folders; the Mac script against a fake filesystem with stubbed `ps` and `pkgutil`. **Not yet run on a real Mac, and the Mac launchd labels and install folders for several vendors are matched on keywords rather than confirmed paths.** Validate against lab installs of the products that matter most.
+- Found while testing: a `^Senso` pattern matched Windows' own `SensorService`, which would have reported Senso.cloud on every machine. Tightened to the product's real names.
+
 ## 2026-10-29
 
 ### Misc - Audit Password Strength (new script)

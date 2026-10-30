@@ -53,6 +53,7 @@ See [HOWTO.md](../HOWTO.md) for guidance on downloading and running scripts.
 | [Audit Admin Users.sh](Security/Audit%20Admin%20Users.sh) | Reports all users with administrator privileges on the device |
 | [Detect Antivirus.sh](Security/Detect%20Antivirus.sh) | Detects installed/active third-party antivirus or EDR products and falls back to Apple XProtect status; reports to NinjaOne `installedAntivirus` field |
 | [Detect CVE CloudMensis.sh](Security/Detect%20CVE%20CloudMensis.sh) | Checks for indicators of the CloudMensis macOS spyware |
+| [Detect Competing RMM.sh](Security/Detect%20Competing%20RMM.sh) | Scans for other MSPs' RMM agents (ConnectWise Automate, Datto, Kaseya, N-able, Atera, Syncro, Addigy, and more) and remote access tools (ScreenConnect, AnyDesk, TeamViewer, Splashtop, and more) using app bundles, launchd jobs, installer receipts, processes and install folders; reports to NinjaOne `competingRmm` field. `--pre-onboarding` treats a NinjaOne agent as competing, `--ignore` skips tools you use yourself |
 | [Detect MDM Enrollment.sh](Security/Detect%20MDM%20Enrollment.sh) | Reports whether the device is enrolled in an MDM platform |
 | [Get FileVault Key.sh](Security/Get%20FileVault%20Key.sh) | Retrieves the FileVault recovery key for the device |
 | [Get FileVault Status.sh](Security/Get%20FileVault%20Status.sh) | Reports the current FileVault encryption status and publishes it to the diskEncryptionStatus Ninja custom field |
