@@ -319,7 +319,7 @@ try {
     Write-Log 'Scanning for competing RMM agents and remote access tools...'
 
     $programs  = @(Get-ProgramNames)
-    $services  = @(Get-CimInstance Win32_Service -ErrorAction Stop)
+    $services  = @(Get-Service -ErrorAction Stop)
     $processes = @(Get-Process -ErrorAction SilentlyContinue)
     $profiles  = @(Get-ProfilePaths)
 
@@ -336,8 +336,8 @@ try {
             $evidence.Add("installed program '$($p.Name)$ver'")
         }
         foreach ($s in ($services | Where-Object { $_.Name -match $product.Match -or $_.DisplayName -match $product.Match })) {
-            $evidence.Add("service '$($s.Name)' ($($s.State))")
-            if ($s.State -eq 'Running') { $active = $true }
+            $evidence.Add("service '$($s.Name)' ($($s.Status))")
+            if ($s.Status -eq 'Running') { $active = $true }
         }
         foreach ($proc in ($processes | Where-Object { $_.ProcessName -match $product.Match } | Select-Object -ExpandProperty ProcessName -Unique)) {
             $evidence.Add("process '$proc'")
