@@ -4,6 +4,32 @@ All notable changes to this repository are documented here. Entries are grouped 
 
 ## 2026-10-30
 
+### Microsoft 365/Security and Compliance - Configure Email Threat Protection (new script, not yet run against a real tenant)
+
+Onboarding tool for customer spam, phishing and malware filtering. It works with Exchange Online Protection alone or with Defender for Office 365 (Business Premium includes Plan 1), detected from the cmdlets the tenant offers (`-DefenderLicense` overrides). **By default it only audits and changes nothing.** The audit lists every change `-Apply` would make, with the exact command.
+
+- **Baseline:** the Standard or Strict (`-Level`) values from Microsoft Learn's [Recommendations for Microsoft 365 security settings](https://learn.microsoft.com/en-us/defender-office-365/recommended-settings-for-eop-and-office365) (updated 2026-08-10). Secondary sources: the CISA SCuBA Exchange Online and Security Suite baselines (March 2026) and CIS Microsoft 365 Foundations v6.0.1. Every finding names its source and links to it in the HTML report. The CIS v7.0.0 text (May 2026) was not available to check against.
+- **Never loosens a setting.** A value already stricter than the target passes and is not changed: a lower bulk threshold, Quarantine where Standard says Junk, or a more aggressive phishing threshold. The comparison is by type (higher is stricter, lower is stricter, action strength, or quarantine-policy equivalents), not by exact match.
+- **What -Apply changes:**
+  - The default anti-spam, anti-malware, anti-phishing, outbound spam and connection filter policies. Custom policies are reported, and changed only with `-IncludeCustomPolicies`. Microsoft-managed preset policies are never touched.
+  - With Defender, a "Baseline Safe Links" policy at the lowest priority for all accepted domains. Built-in protection's Safe Links does not rewrite URLs, allows click-through and skips internal mail.
+  - With Defender: Safe Attachments for SharePoint/OneDrive/Teams, Teams ZAP, and impersonation protection for `-ProtectedUsers` / `-ProtectedDomains` (existing entries kept).
+  - The Outlook external sender tag.
+  - DKIM: enabled where the CNAMEs are published. Otherwise keys are created and the CNAMEs to publish are printed.
+  - `Enable-OrganizationCustomization` in dehydrated tenants.
+  - `-EnablePresetPolicy` turns on an existing Standard/Strict preset for all accepted domains.
+- **Why default policies and not presets:** Microsoft says the Standard/Strict preset policies can only be created by turning them on once in the Defender portal, and their impersonation lists are portal-only. So the script applies the same values to the default policies, which works in every tenant. It reports preset state and order of precedence for each area. Default policies that a preset fully covers are marked "not reached" and are not compared.
+- **Reported, never removed:** allowed sender domains and senders in anti-spam policies, the connection filter IP allow list, SCL -1 mail flow rules (High when they match on sender domain only, which can be spoofed), Safe Links/Attachments skip headers, rules copying mail outside the organization, and Tenant Allow/Block List allows. Entries that duplicate the phishing simulation override (Advanced delivery) are flagged as redundant. Our own Phinsec/Defendify scripts create several of these on purpose.
+- **Forwarding:** automatic external forwarding is set Off (CISA MS.EXO.1.1v2) unless a mailbox forwards externally. Those mailboxes are listed and the change is held back unless `-ForceForwardingOff` is given. A custom outbound policy that allows forwarding is treated as a deliberate exception.
+- **Mail routing and authentication (DNS, Windows only):** classifies MX per domain (Microsoft, including the new `mx.microsoft` format, a recognized third-party filter such as AppRiver, Proofpoint or Mimecast, or none). It flags a missing Enhanced Filtering for Connectors when a filter sits in front, and leftover partner connectors when it does not. SPF is checked for count, `-all`, the Microsoft include, and DNS lookups including nested includes. DMARC is checked for policy, pct and rua, plus the onmicrosoft.com domain. Domains no mailbox uses as a primary address get parked-domain advice instead of DKIM.
+- **Output:** console summary by area, `Findings.csv`, `Changes.csv`, `Report.html`, and a JSON snapshot of every policy before any change, for documentation and rollback. Runs against your own tenant or customers via GDAP (`-DelegatedOrganization`, one or more).
+- Tested in PowerShell 7 and 5.1 against stubbed Exchange Online and DNS:
+  - A messy Defender tenant: dehydrated, allow lists, SCL -1 rules, external forward, AppRiver MX without Enhanced Filtering, mixed SPF/DKIM/DMARC, a stricter custom policy, and one failing change.
+  - A clean EOP-only tenant with the Standard preset covering everyone.
+  - Standard and Strict, with and without `-IncludeCustomPolicies` and `-EnablePresetPolicy`.
+- **Still to confirm against a real tenant:** Defender detection by cmdlet availability, preset rule scoping as the portal stores it, `RecommendedPolicyType` values, and the Report Submission and Tenant Allow/Block List property names.
+- Found while testing: the home-tenant run did nothing at all, because assigning `@($null)` from an `if` unrolls to `$null` and the tenant loop ran zero times. Fixed.
+
 ### Windows/OS/Security and Mac/Security - Detect Competing RMM (new scripts)
 
 Finds other MSPs' management agents and remote access tools on a device, because a NinjaOne agent cannot be installed by more than one MSP and a leftover agent is the usual reason an onboarding fails or a device is still managed by someone else. Read-only; changes nothing.
