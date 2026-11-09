@@ -2,6 +2,21 @@
 
 All notable changes to this repository are documented here. Entries are grouped by date where commit history allows, otherwise by theme.
 
+## 2026-11-09
+
+### Windows/OS/Security and Mac/Security - Detect Competing RMM: grade each finding, label Take Control correctly on Macs
+
+A device flagged for N-able N-central had nothing installed. The only evidence was a leftover `C:\Program Files (x86)\N-able Technologies` folder, but the `competingRmm` field reported it the same as a running agent.
+
+- **Each product is now graded, and the grade is written to the field.**
+  - **Active:** a matching service or process is running.
+  - **Installed:** nothing is running, but there's an uninstall entry or stopped service (Windows), or an app bundle or launchd job (Mac).
+  - **Leftover:** only files, folders or pkg receipts remain. macOS keeps receipts after an app is deleted.
+  - Field format: `N-able N-central [Leftover], TeamViewer [Active]`. Previously it was a plain product list, and anything short of a running process counted as `Installed`.
+- **`-FailOnDetect` / `--fail-on-detect` now ignore leftovers.** Exit 2 only when a competing RMM is Active or Installed.
+- **Mac: N-able Take Control was reported as the N-central agent.** Its app is named "MSP Anywhere Agent N-central", which matched the N-able RMM keywords. The catalog has a new optional fifth column, `Exclude`. The N-able RMM entry now excludes Take Control names (`msp anywhere`, `take control`, `beanywhere`, `basup`), and Take Control now matches `msp anywhere`. Windows already kept the two apart.
+- Tested: the Windows matching loop against stubbed evidence reproducing the flagged device (N-central and Take Control graded Leftover, GoTo Opener Installed); the Mac matching helpers against the app and launchd names seen on N-able Macs. Not yet run on a real device.
+
 ## 2026-10-30
 
 ### Microsoft 365/Security and Compliance - Configure Email Threat Protection (new script, not yet run against a real tenant)
