@@ -25,16 +25,21 @@
       4. File paths           Program Files, ProgramData, Windows, and per-user
                               locations under every profile (catches portable and
                               per-user installs such as AnyDesk or RustDesk).
-      5. Catalog              Each product is "Active" when a service or process is
-                              running and "Installed" when only files, an uninstall
-                              entry, or a stopped service remain.
+      5. Catalog              Each product found is graded by its strongest evidence:
+                                Active     a matching service or process is running.
+                                Installed  an uninstall entry or a stopped service
+                                           exists, but nothing is running.
+                                Leftover   only files or folders remain, typically
+                                           after an uninstall that did not clean up.
 
     The NinjaOne agent itself is reported as informational and is never counted as
     a conflict, since this script normally runs from it. Use -PreOnboarding when
     scanning a device that is NOT yet under your NinjaOne instance (run from a
     different tool): any NinjaOne agent found is then another MSP's.
 
-    The result is written to a NinjaOne custom device field and printed to stdout.
+    The result is written to a NinjaOne custom device field and printed to stdout,
+    as a comma separated list of "Product [Grade]" entries (RMM agents first), for
+    example "N-able N-central [Leftover], TeamViewer [Active]", or "None detected".
 
 .PARAMETER PreOnboarding
     Treat a NinjaOne agent as a competing RMM. Env: PRE_ONBOARDING (true/1).
@@ -45,8 +50,9 @@
     names printed in the output. Env: IGNORE_PRODUCTS (comma separated).
 
 .PARAMETER FailOnDetect
-    Exit 2 when a competing RMM (not just a remote access tool) is found, so the
-    run can be used as a NinjaOne condition. Env: FAIL_ON_DETECT (true/1).
+    Exit 2 when a competing RMM (not just a remote access tool) is Active or
+    Installed, so the run can be used as a NinjaOne condition. Leftovers alone do
+    not trigger it. Env: FAIL_ON_DETECT (true/1).
 
 .NOTES
     Designed for NinjaOne RMM deployment at SYSTEM level. Also runs directly with
@@ -60,7 +66,8 @@
       FAIL_ON_DETECT   - (optional) true/1, see -FailOnDetect.
 
     Exit codes: 0 = scan completed (whether or not anything was found),
-                1 = the scan failed, 2 = -FailOnDetect and a competing RMM found.
+                1 = the scan failed, 2 = -FailOnDetect and a competing RMM is
+                Active or Installed.
 
     Per-user detection covers hives that are loaded plus well-known per-user
     folders under every profile. A per-user install by a user who has never
@@ -330,14 +337,16 @@ try {
 
         $evidence = New-Object 'System.Collections.Generic.List[string]'
         $active = $false
+        $installed = $false
 
         foreach ($p in ($programs | Where-Object { $_.Name -match $product.Match })) {
             $ver = if ($p.Version) { " $($p.Version)" } else { '' }
             $evidence.Add("installed program '$($p.Name)$ver'")
+            $installed = $true
         }
         foreach ($s in ($services | Where-Object { $_.Name -match $product.Match -or $_.DisplayName -match $product.Match })) {
             $evidence.Add("service '$($s.Name)' ($($s.Status))")
-            if ($s.Status -eq 'Running') { $active = $true }
+            if ($s.Status -eq 'Running') { $active = $true } else { $installed = $true }
         }
         foreach ($proc in ($processes | Where-Object { $_.ProcessName -match $product.Match } | Select-Object -ExpandProperty ProcessName -Unique)) {
             $evidence.Add("process '$proc'")
@@ -361,7 +370,7 @@ try {
         $findings.Add([PSCustomObject]@{
             Name     = $product.Name
             Type     = $type
-            State    = if ($active) { 'Active' } else { 'Installed' }
+            State    = if ($active) { 'Active' } elseif ($installed) { 'Installed' } else { 'Leftover' }
             Evidence = @($evidence | Select-Object -Unique)
         })
     }
@@ -395,8 +404,8 @@ try {
         Write-Host 'No competing RMM agents or remote access tools detected.'
     }
 
-    # Field value: a plain comma separated list of product names (RMM agents first)
-    $names  = @(@($rmm) + @($remote) | ForEach-Object { $_.Name })
+    # Field value: comma separated "Product [Grade]" entries (RMM agents first)
+    $names  = @(@($rmm) + @($remote) | ForEach-Object { "$($_.Name) [$($_.State)]" })
     $result = if ($names.Count -gt 0) { $names -join ', ' } else { 'None detected' }
 
     Write-Host '------------------------------------------------------------'
@@ -419,7 +428,7 @@ try {
         }
     }
 
-    if ($FailOnDetect -and $rmm.Count -gt 0) { exit 2 }
+    if ($FailOnDetect -and @($rmm | Where-Object { $_.State -ne 'Leftover' }).Count -gt 0) { exit 2 }
 
 } catch {
     Write-Log "Unhandled error: $($_.Exception.Message)" 'Error'

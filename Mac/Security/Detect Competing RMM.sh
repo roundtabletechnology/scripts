@@ -23,8 +23,12 @@
 #     5. Install folders      /Library, /Library/Application Support, /opt,
 #                             /usr/local, plus explicit paths per product
 #
-#   A product is "Active" when a matching process is running and "Installed"
-#   when only files, receipts or launchd jobs remain.
+#   Each product found is graded by its strongest evidence:
+#     Active     a matching process is running.
+#     Installed  an app bundle or launchd job exists, but nothing is running.
+#     Leftover   only installer receipts or folders remain. macOS keeps pkg
+#                receipts after an app is deleted, so these are usually what an
+#                uninstall left behind.
 #
 #   The NinjaOne agent itself is reported as informational and is never counted
 #   as a conflict, since this script normally runs from it. Use --pre-onboarding
@@ -32,7 +36,9 @@
 #   agent found is then another MSP's.
 #
 #   The result is written to a NinjaOne custom device field (default:
-#   competingRmm) and printed to stdout for activity logs.
+#   competingRmm) and printed to stdout for activity logs, as a comma separated
+#   list of "Product [Grade]" entries (RMM agents first), for example
+#   "N-able Take Control (BeAnywhere) [Leftover]", or "None detected".
 #
 # .NOTES
 #   Designed for NinjaOne RMM deployment (SYSTEM / root level). Also runs
@@ -46,7 +52,8 @@
 #                         substring match on the names printed in the output.
 #                         Env: IGNORE_PRODUCTS
 #     --fail-on-detect    Exit 2 when a competing RMM (not just a remote access
-#                         tool) is found, so the run can be a NinjaOne condition.
+#                         tool) is Active or Installed, so the run can be a
+#                         NinjaOne condition. Leftovers alone do not trigger it.
 #                         Env: FAIL_ON_DETECT (true/1)
 #
 #   Environment Variables (NinjaOne / RMM):
@@ -54,7 +61,8 @@
 #                         Defaults to "competingRmm". Set to empty to skip.
 #
 #   Exit codes: 0 = scan completed (whether or not anything was found),
-#               1 = the scan failed, 2 = --fail-on-detect and a competing RMM found.
+#               1 = the scan failed, 2 = --fail-on-detect and a competing RMM is
+#               Active or Installed.
 #
 #   Several macOS footprints below (launchd labels and install folders) are
 #   matched on vendor keywords rather than exact paths, because vendors vary them
@@ -139,13 +147,16 @@ FOLDERS=$(names_in /Library "/Library/Application Support" /opt /usr/local)
 # ==============================================================================
 # Product catalog
 #
-#   One product per line:  Name # Type # Regex # Path;Path;...
+#   One product per line:  Name # Type # Regex # Path;Path;... # Exclude
 #
-#   Type   RMM, Remote (remote access) or Own (NinjaOne, see description).
-#   Regex  Case-insensitive ERE tested against every name gathered above. Built
-#          from B (a word boundary) plus vendor keywords. Keep it specific: it
-#          is the main cause of false positives.
-#   Paths  Explicit globs (spaces are fine) checked as-is.
+#   Type     RMM, Remote (remote access) or Own (NinjaOne, see description).
+#   Regex    Case-insensitive ERE tested against every name gathered above.
+#            Built from B (a word boundary) plus vendor keywords. Keep it
+#            specific: it is the main cause of false positives.
+#   Paths    Explicit globs (spaces are fine) checked as-is.
+#   Exclude  Optional ERE. Names and paths matching it are dropped, for another
+#            product whose names contain this one's keywords (N-able's Take
+#            Control app is "MSP Anywhere Agent N-central").
 #
 # Sources: vendor documentation, the LOLRMM catalog (lolrmm.io), and agent
 # footprints observed on managed devices. Add new products at the bottom of the
@@ -160,7 +171,7 @@ ConnectWise Automate (LabTech)#RMM#${B}(labtech|ltechagent|ltsvc|connectwise\.au
 ConnectWise RMM (Continuum)#RMM#${B}(continuum|itsplatform|saaz)#
 Datto RMM (CentraStage)#RMM#${B}(centrastage|aemagent|cagservice|datto\.rmm|dattormm)#/Applications/CentraStage*;/Library/Application Support/CentraStage*
 Kaseya VSA#RMM#${B}(kaseya|agentmon)#/Library/Kaseya*;/Applications/Kaseya*
-N-able (N-central / RMM / SolarWinds MSP)#RMM#${B}(n-able|n-central|ncentral|solarwindsmsp|solarwinds\.msp|advanced.?monitoring)#/Library/N-able*
+N-able (N-central / RMM / SolarWinds MSP)#RMM#${B}(n-able|n-central|ncentral|solarwindsmsp|solarwinds\.msp|advanced.?monitoring)#/Library/N-able*#(msp.?anywhere|take.?control|beanywhere|basup)
 Atera#RMM#${B}atera#/Applications/AteraAgent*;/Library/Application Support/Atera*
 Syncro (Kabuto)#RMM#${B}(syncro|kabuto|repairtech)#/Applications/Syncro*;/Library/Application Support/Syncro*
 SuperOps#RMM#${B}superops#
@@ -190,7 +201,7 @@ LogMeIn / GoTo#Remote#${B}(logmein|gotomypc|lmirescue)#/Applications/LogMeIn*
 RustDesk#Remote#${B}rustdesk#/Applications/RustDesk.app
 Zoho Assist#Remote#${B}(zoho.?assist|zohomeeting|zohors)#
 BeyondTrust (Bomgar)#Remote#${B}(beyondtrust|bomgar)#
-N-able Take Control (BeAnywhere)#Remote#${B}(take.?control|beanywhere|basupport|basup)#
+N-able Take Control (BeAnywhere)#Remote#${B}(take.?control|beanywhere|basupport|basup|msp.?anywhere)#
 MeshCentral (Mesh Agent)#Remote#${B}(meshagent|mesh\.agent|meshcentral)#/usr/local/mesh_services*
 SimpleHelp#Remote#${B}simplehelp#/Library/Application Support/SimpleHelp*
 NetSupport Manager#Remote#${B}netsupport#
@@ -227,32 +238,40 @@ ignored() {
     return 1
 }
 
-# hits <label> <regex> <names> : prints "label 'name'" for each match
+# without <exclude> : passes stdin through, dropping lines matching <exclude>
+without() {
+    if [[ -n "$1" ]]; then grep -viE -e "$1" 2>/dev/null; else cat; fi
+}
+
+# hits <label> <regex> <names> [exclude] : prints "label 'name'" for each match
 hits() {
-    local label="$1" regex="$2" names="$3" line
-    echo "$names" | grep -iE -e "$regex" 2>/dev/null | sort -u | while IFS= read -r line; do
+    local label="$1" regex="$2" names="$3" exclude="$4" line
+    echo "$names" | grep -iE -e "$regex" 2>/dev/null | without "$exclude" | sort -u | while IFS= read -r line; do
         [[ -n "$line" ]] && echo "$label '$line'"
     done
 }
 
-RMM_BLOCK=""    RMM_NAMES=""    RMM_COUNT=0
+RMM_BLOCK=""    RMM_NAMES=""    RMM_COUNT=0    RMM_LIVE_COUNT=0
 REMOTE_BLOCK="" REMOTE_NAMES="" REMOTE_COUNT=0
 OWN_BLOCK=""
 
 log_info "Scanning for competing RMM agents and remote access tools..."
 
-while IFS='#' read -r name type regex paths; do
+while IFS='#' read -r name type regex paths exclude; do
     [[ -z "$name" ]] && continue
     ignored "$name" && continue
 
-    evidence=""
-    evidence="${evidence}$(hits 'app' "$regex" "$APPS")"$'\n'
-    evidence="${evidence}$(hits 'launchd job' "$regex" "$LAUNCHD")"$'\n'
-    evidence="${evidence}$(hits 'installer receipt' "$regex" "$PKGS")"$'\n'
-    evidence="${evidence}$(hits 'folder' "$regex" "$FOLDERS")"$'\n'
+    # Installed: an app bundle or launchd job. Leftover: receipts and folders.
+    installed_hits="$(hits 'app' "$regex" "$APPS" "$exclude")"$'\n'
+    installed_hits="${installed_hits}$(hits 'launchd job' "$regex" "$LAUNCHD" "$exclude")"
+    installed_hits=$(echo "$installed_hits" | grep -v '^$')
+
+    evidence="${installed_hits}"$'\n'
+    evidence="${evidence}$(hits 'installer receipt' "$regex" "$PKGS" "$exclude")"$'\n'
+    evidence="${evidence}$(hits 'folder' "$regex" "$FOLDERS" "$exclude")"$'\n'
 
     active=0
-    proc_hits=$(hits 'process' "$regex" "$PROCS")
+    proc_hits=$(hits 'process' "$regex" "$PROCS" "$exclude")
     if [[ -n "$proc_hits" ]]; then
         evidence="${evidence}${proc_hits}"$'\n'
         active=1
@@ -264,22 +283,25 @@ while IFS='#' read -r name type regex paths; do
             [[ -z "$p" ]] && continue
             while IFS= read -r found; do
                 [[ -n "$found" ]] && evidence="${evidence}path '$found'"$'\n'
-            done < <(compgen -G "$p" 2>/dev/null)
+            done < <(compgen -G "$p" 2>/dev/null | without "$exclude")
         done
     fi
 
     evidence=$(echo "$evidence" | grep -v '^$' | awk '!seen[$0]++')
     [[ -z "$evidence" ]] && continue
 
-    state="Installed"; [[ "$active" -eq 1 ]] && state="Active"
+    if [[ "$active" -eq 1 ]]; then state="Active"
+    elif [[ -n "$installed_hits" ]]; then state="Installed"
+    else state="Leftover"; fi
 
     if [[ "$type" == "Own" && "$PRE_ONBOARDING_MODE" -eq 1 ]]; then type="RMM"; fi
 
     block="  - ${name} [${state}]"$'\n'"$(echo "$evidence" | sed 's/^/      /')"$'\n'
-    label="$name"
+    label="${name} [${state}]"
 
     case "$type" in
-        RMM)    RMM_BLOCK="${RMM_BLOCK}${block}";       RMM_NAMES="${RMM_NAMES:+$RMM_NAMES, }${label}";       RMM_COUNT=$((RMM_COUNT + 1)) ;;
+        RMM)    RMM_BLOCK="${RMM_BLOCK}${block}";       RMM_NAMES="${RMM_NAMES:+$RMM_NAMES, }${label}";       RMM_COUNT=$((RMM_COUNT + 1))
+                [[ "$state" != "Leftover" ]] && RMM_LIVE_COUNT=$((RMM_LIVE_COUNT + 1)) ;;
         Remote) REMOTE_BLOCK="${REMOTE_BLOCK}${block}"; REMOTE_NAMES="${REMOTE_NAMES:+$REMOTE_NAMES, }${label}"; REMOTE_COUNT=$((REMOTE_COUNT + 1)) ;;
         Own)    OWN_BLOCK="${OWN_BLOCK}${block}" ;;
     esac
@@ -302,7 +324,7 @@ if [[ "$RMM_COUNT" -eq 0 && "$REMOTE_COUNT" -eq 0 ]]; then
     echo "No competing RMM agents or remote access tools detected."
 fi
 
-# Field value: a plain comma separated list of product names (RMM agents first)
+# Field value: comma separated "Product [Grade]" entries (RMM agents first)
 RESULT=""
 [[ "$RMM_COUNT" -gt 0 ]]    && RESULT="${RMM_NAMES}"
 [[ "$REMOTE_COUNT" -gt 0 ]] && RESULT="${RESULT:+$RESULT, }${REMOTE_NAMES}"
@@ -327,5 +349,5 @@ if [[ -n "$NINJA_FIELD_NAME" ]]; then
     fi
 fi
 
-if [[ "$FAIL_ON_DETECT_MODE" -eq 1 && "$RMM_COUNT" -gt 0 ]]; then exit 2; fi
+if [[ "$FAIL_ON_DETECT_MODE" -eq 1 && "$RMM_LIVE_COUNT" -gt 0 ]]; then exit 2; fi
 exit 0
