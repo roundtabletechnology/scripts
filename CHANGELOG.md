@@ -2,6 +2,20 @@
 
 All notable changes to this repository are documented here. Entries are grouped by date where commit history allows, otherwise by theme.
 
+## 2026-11-17
+
+### Mac/OS - Set Admin Password (new script, not yet run on a real Mac)
+
+Rotates a local admin account's password on macOS using the old and new passwords from NinjaOne org custom fields, without breaking the account's Secure Token or the FileVault unlock screen.
+
+- **Why a new script instead of Set User Password:** that script uses `sysadminctl -resetPasswordFor` without token credentials. On a Secure Token account a reset changes only the login password; the FileVault unlock screen keeps the old password, the token can stop working and the login keychain no longer opens. Apple DTS (developer forums thread 772011) and macOSLAPS both state the old password must be known to change a Secure Token account safely.
+- **Never resets.** If the new password already works it only verifies (safe to run org-wide and re-run). If neither password works it stops and changes nothing.
+- **Change:** `sysadminctl -adminUser <user> -adminPassword <old> -resetPasswordFor <user> -newPassword <new>` (the account authorizes with its own token), falling back to `dscl . -passwd <user> <old> <new>`. Success is checked with `dscl -authonly`, not the exit code, because sysadminctl often exits 0 on failure.
+- **Verify:** Secure Token still ENABLED. For APFS crypto users, `diskutil apfs changePassphrase` confirms the new password unlocks the Data volume, and moves the unlock password from old to new if it was left behind. Preboot is refreshed when FileVault is on.
+- **Login keychain:** changed from old to new with `security set-keychain-password` as the account; if it opens with neither password it is moved aside as a `.bak` so the next login creates a fresh one.
+- **Fields:** `clientAdminName`, `clientAdminPwOld`, `clientAdminPw` by default; each can be renamed with `USERNAME_FIELD`, `OLD_PASSWORD_FIELD`, `NEW_PASSWORD_FIELD`. `ADMIN_USERNAME` / `ADMIN_OLD_PASSWORD` / `ADMIN_NEW_PASSWORD` allow running outside NinjaOne.
+- Tested: every path (normal change, re-run, neither password works, FileVault left on the old password, sysadminctl failure with dscl fallback, keychain on an unknown password) against stubbed macOS commands, with passwords containing spaces, `$` and quotes. Not yet run on a real Mac; pilot on one FileVault Mac before org-wide use.
+
 ## 2026-11-09
 
 ### Windows/OS/Security and Mac/Security - Detect Competing RMM: grade each finding, label Take Control correctly on Macs

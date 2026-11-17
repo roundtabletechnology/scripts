@@ -44,6 +44,7 @@ See [HOWTO.md](../HOWTO.md) for guidance on downloading and running scripts.
 | [Create Desktop Shortcut.sh](OS/Create%20Desktop%20Shortcut.sh) | Creates a URL shortcut on the user's Desktop |
 | [Get Apple IDs.sh](OS/Get%20Apple%20IDs.sh) | Reports Apple IDs associated with accounts on the device |
 | [Get Installed Printers.sh](OS/Get%20Installed%20Printers.sh) | Lists installed printers (name and device URI), skipping fax/PDF/OneNote/NinjaRemote queues; reports to NinjaOne `printers` field |
+| [Set Admin Password.sh](OS/Set%20Admin%20Password.sh) | Changes a local admin password from the old to the new password in NinjaOne org fields (`clientAdminName`, `clientAdminPwOld`, `clientAdminPw`), keeping the Secure Token, FileVault unlock password and login keychain in sync. Never resets without the old password; safe to re-run |
 | [Set User Password.sh](OS/Set%20User%20Password.sh) | Sets the password for a specified local user account |
 
 ### Security
