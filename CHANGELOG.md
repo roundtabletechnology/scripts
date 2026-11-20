@@ -13,7 +13,7 @@ Stops Edge's side-pane Copilot from reading page content, for customers worried 
 - **Not written:** `CopilotCDPPageContext`, obsolete and ignored after Edge 132.
 - **Limits, stated in the script help:** neither policy applies to personal Microsoft account profiles; neither hides Copilot or the sidebar (that is `Microsoft365CopilotChatIconEnabled` / `HubsSidebarEnabled`); Microsoft's docs do not say whether Copilot Mode tab features follow these policies, so confirm on a test device.
 - Idempotent, verifies each value by reading it back, `-Revert` / `REVERT` deletes both values. Exit 0 / 1.
-- Tested: set, re-run, and revert against a throwaway registry key. Not yet confirmed in `edge://policy` on a device.
+- Tested: set, re-run, and revert against a throwaway registry key, then set and revert on a real Windows 11 device in Windows PowerShell 5.1. Run from NinjaOne, `edge://policy` showed both policies as false, Mandatory, Status OK. Not yet checked that Copilot actually stops reading page content, or how Copilot Mode behaves.
 
 ## 2026-11-17
 
