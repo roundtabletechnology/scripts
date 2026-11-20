@@ -2,6 +2,19 @@
 
 All notable changes to this repository are documented here. Entries are grouped by date where commit history allows, otherwise by theme.
 
+## 2026-11-20
+
+### Windows/Applications - Disable Edge Copilot Page Context (new script)
+
+Stops Edge's side-pane Copilot from reading page content, for customers worried about Copilot seeing their other open tabs. Started from a technician's two-line registry fix (`EdgeEntraCopilotPageContext` = 0), checked against Microsoft Learn's Edge policy reference.
+
+- **Confirmed:** `EdgeEntraCopilotPageContext` (REG_DWORD, `HKLM\SOFTWARE\Policies\Microsoft\Edge`, Edge 130+) is the right policy for Copilot with enterprise data protection, including Microsoft 365 Copilot Chat. Unset, Copilot can read page content by default outside the EU.
+- **Added `CopilotPageContext` = 0 as well.** Microsoft documents it as a separate policy for Copilot without enterprise data protection (Edge 124+, Entra profiles). The original fix did not cover it.
+- **Not written:** `CopilotCDPPageContext`, obsolete and ignored after Edge 132.
+- **Limits, stated in the script help:** neither policy applies to personal Microsoft account profiles; neither hides Copilot or the sidebar (that is `Microsoft365CopilotChatIconEnabled` / `HubsSidebarEnabled`); Microsoft's docs do not say whether Copilot Mode tab features follow these policies, so confirm on a test device.
+- Idempotent, verifies each value by reading it back, `-Revert` / `REVERT` deletes both values. Exit 0 / 1.
+- Tested: set, re-run, and revert against a throwaway registry key. Not yet confirmed in `edge://policy` on a device.
+
 ## 2026-11-17
 
 ### Mac/OS - Set Admin Password (new script, not yet run on a real Mac)

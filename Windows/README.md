@@ -37,6 +37,7 @@ Scripts are organized into subfolders by function. For guidance on downloading a
 | [Configure Chrome Updates.bat](Applications/Configure%20Chrome%20Updates.bat) | Configures Google Chrome update policy via registry |
 | [Configure FortiClient VPN.ps1](Applications/Configure%20FortiClient%20VPN.ps1) | Deploys FortiClient VPN configuration |
 | [Enable Outlook Meeting Copy.bat](Applications/Enable%20Outlook%20Meeting%20Copy.bat) | Enables the copy-to-calendar feature for Outlook meeting responses |
+| [Disable Edge Copilot Page Context.ps1](Applications/Disable%20Edge%20Copilot%20Page%20Context.ps1) | Blocks Edge Copilot from reading page content (Entra profiles) via the EdgeEntraCopilotPageContext and CopilotPageContext policies |
 | [Get Application Version.ps1](Applications/Get%20Application%20Version.ps1) | Reports the installed version of a specified application |
 | [Get Datto Cloud Continuity Logs.ps1](Applications/Get%20Datto%20Cloud%20Continuity%20Logs.ps1) | Retrieves Datto Cloud Continuity agent logs for diagnostics |
 | [Install AnyConnect.bat](Applications/Install%20AnyConnect.bat) | Installs Cisco AnyConnect VPN client |
