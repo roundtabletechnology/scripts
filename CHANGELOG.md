@@ -88,7 +88,7 @@ Finds other MSPs' management agents and remote access tools on a device, because
 
 ### Mac/Security - Get Secure Token Users (new script)
 
-Prints the short name of every local user that holds a Secure Token, one per line, with nothing else on stdout (notes go to stderr), so `token_user=$(./"Get Secure Token Users.sh")` works. It replaces the `dscl ... | sysadminctl -secureTokenStatus` one-liner, whose output names the account's full name ("System Administrator") instead of its short name and lists the DISABLED accounts too. Checks admin group members plus every UID 500+ account, skipping root and `_` service accounts. Exits 1 when no user has a token. Optional `SECURE_TOKEN_FIELD` publishes the comma-separated list to a NinjaOne field.
+Prints the short name of every local user that holds a Secure Token, one per line, with nothing else on stdout (notes go to stderr), so `token_user=$(./"Get Secure Token Users.sh")` works. It replaces the `dscl ... | sysadminctl -secureTokenStatus` one-liner, whose output names the account's full name ("System Administrator") instead of its short name and lists the DISABLED accounts too. Checks admin group members plus every UID 500+ account, skipping root and `_` service accounts. Exits 1 when no user has a token. Publishes the comma-separated list to the NinjaOne `secureTokenUsers` field by default (override with `SECURE_TOKEN_FIELD`, or set it empty to skip).
 
 - Tested with stubbed `dscl`/`sysadminctl` only (no Mac available), covering a token holder, no token holder and variable capture. **Still to confirm on a real Mac.**
 

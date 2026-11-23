@@ -24,11 +24,12 @@
 #
 #   Environment variables / NinjaOne script variables (optional):
 #     SECURE_TOKEN_FIELD - NinjaOne custom field to publish the comma-separated
-#                          list to. Not published when empty (default).
+#                          list to. Default secureTokenUsers. Set to an empty
+#                          string to skip publishing.
 # ==============================================================================
 
 NINJA_CLI="/Applications/NinjaRMMAgent/programdata/ninjarmm-cli"
-NINJA_CUSTOM_FIELD="${SECURE_TOKEN_FIELD:-}"
+NINJA_CUSTOM_FIELD="${SECURE_TOKEN_FIELD-secureTokenUsers}"
 
 if [[ "$(uname)" != "Darwin" ]]; then
     echo "This script only runs on macOS." >&2
