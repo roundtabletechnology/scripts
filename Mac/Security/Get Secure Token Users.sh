@@ -11,13 +11,16 @@
 #
 #       token_user=$(./"Get Secure Token Users.sh")
 #
-#   Separately, it reads the disk's own list of cryptographic users
-#   (diskutil apfs listUsers /) and matches every local account against it. Those
-#   are the accounts whose password unlocks the FileVault disk at startup, whether
-#   or not they hold a Secure Token. That list is published to NinjaOne; stdout
-#   stays the Secure Token list. Volume ownership (the right to authorize macOS
-#   updates and security policy on Apple silicon) cannot be read reliably from
-#   the command line, so it is not reported.
+#   It also reads the disk's own list of cryptographic users
+#   (diskutil apfs listUsers /) and matches every local account against it.
+#   Those are the accounts whose password unlocks the FileVault disk at startup,
+#   whether or not they hold a Secure Token. Volume ownership (the right to
+#   authorize macOS updates and security policy on Apple silicon) cannot be read
+#   reliably from the command line, so it is not reported.
+#
+#   Both results are published to one NinjaOne field, with a tag per account:
+#       rtt_admin (token, unlock); bob (unlock); jane (token)
+#   stdout stays the plain Secure Token list.
 #
 #   Notes about the output are written to stderr. sysadminctl prints the
 #   account's full name rather than its short name, so this script matches on
@@ -28,20 +31,17 @@
 #
 #   Exit codes:
 #     0  at least one user holds a Secure Token
-#     1  no user holds a Secure Token (or not a Mac)
+#     1  no user holds a Secure Token (or not a Mac). The NinjaOne field is still
+#        published, so accounts that can unlock the disk are not lost.
 #
 #   Environment variables / NinjaOne script variables (optional):
-#     SECURE_TOKEN_FIELD - NinjaOne custom field to publish the comma-separated
-#                          list to. Default secureTokenUsers. Set to an empty
-#                          string to skip publishing.
-#     UNLOCK_USERS_FIELD - NinjaOne custom field for the accounts that can unlock
-#                          the disk. Default fileVaultUnlockUsers.
-#                          Set to an empty string to skip publishing.
+#     SECURE_TOKEN_FIELD - NinjaOne custom field to publish to. Default
+#                          secureTokenUsers (Text, 200 characters). Set to an
+#                          empty string to skip publishing.
 # ==============================================================================
 
 NINJA_CLI="/Applications/NinjaRMMAgent/programdata/ninjarmm-cli"
 NINJA_CUSTOM_FIELD="${SECURE_TOKEN_FIELD-secureTokenUsers}"
-NINJA_UNLOCK_FIELD="${UNLOCK_USERS_FIELD-fileVaultUnlockUsers}"
 
 if [[ "$(uname)" != "Darwin" ]]; then
     echo "This script only runs on macOS." >&2
@@ -66,16 +66,16 @@ for u in $candidates; do
     fi
 done
 
-if [[ ${#token_users[@]} -eq 0 ]]; then
+if [[ ${#token_users[@]} -gt 0 ]]; then
+    printf '%s
+' "${token_users[@]}"
+else
     echo "No local user holds a Secure Token." >&2
-    exit 1
 fi
-
-printf '%s\n' "${token_users[@]}"
 
 # Every local account whose GeneratedUID is an APFS cryptographic user of the boot
 # volume. Other entries (recovery keys, iCloud) have no local account and are
-# only counted.
+# skipped.
 crypto_users=$(diskutil apfs listUsers / 2>/dev/null)
 unlock_users=()
 while read -r name guid; do
@@ -83,33 +83,23 @@ while read -r name guid; do
         unlock_users+=("$name")
     fi
 done < <(dscl . -list /Users GeneratedUID 2>/dev/null)
-echo "Can unlock the disk: ${unlock_users[*]:-none}" >&2
 
-# Flag accounts that unlock the disk without a token, or hold a token without
-# being able to unlock the disk.
-for u in "${unlock_users[@]}"; do
-    case " ${token_users[*]} " in *" $u "*) ;; *) echo "Note: $u can unlock the disk but has no Secure Token." >&2 ;; esac
+# One entry per account: "name (token, unlock)"
+summary=""
+for u in "${token_users[@]}" "${unlock_users[@]}"; do
+    case "; $summary" in *"; $u ("*) continue ;; esac
+    tags=""
+    case " ${token_users[*]} " in *" $u "*) tags="token" ;; esac
+    case " ${unlock_users[*]} " in *" $u "*) tags="${tags:+$tags, }unlock" ;; esac
+    summary="${summary:+$summary; }$u ($tags)"
 done
-for u in "${token_users[@]}"; do
-    case " ${unlock_users[*]} " in *" $u "*) ;; *) echo "Note: $u has a Secure Token but cannot unlock the disk." >&2 ;; esac
-done
+echo "Accounts: ${summary:-none}" >&2
 
-set_ninja_field() {
-    local field="$1"; shift
-    [[ -n "$field" && -f "$NINJA_CLI" ]] || return 0
-    local list
-    list=$(printf '%s,' "$@")
-    list="${list%,}"
-    if ! "$NINJA_CLI" set "$field" "$list" >/dev/null 2>&1; then
-        echo "Warning: could not set NinjaOne field '$field' (run as root)." >&2
+if [[ -n "$NINJA_CUSTOM_FIELD" && -f "$NINJA_CLI" ]]; then
+    if ! "$NINJA_CLI" set "$NINJA_CUSTOM_FIELD" "${summary:-none}" >/dev/null 2>&1; then
+        echo "Warning: could not set NinjaOne field '$NINJA_CUSTOM_FIELD' (run as root)." >&2
     fi
-}
-
-set_ninja_field "$NINJA_CUSTOM_FIELD" "${token_users[@]}"
-if [[ ${#unlock_users[@]} -gt 0 ]]; then
-    set_ninja_field "$NINJA_UNLOCK_FIELD" "${unlock_users[@]}"
-else
-    set_ninja_field "$NINJA_UNLOCK_FIELD" "none"
 fi
 
-exit 0
+[[ ${#token_users[@]} -gt 0 ]] && exit 0
+exit 1
