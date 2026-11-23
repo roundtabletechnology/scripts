@@ -11,9 +11,10 @@
 #
 #       token_user=$(./"Get Secure Token Users.sh")
 #
-#   Of those users, it also works out which ones are APFS cryptographic users
-#   (listed by diskutil apfs listUsers /), meaning their password can unlock the
-#   FileVault disk at startup. That list is published to NinjaOne only; stdout
+#   Separately, it reads the disk's own list of cryptographic users
+#   (diskutil apfs listUsers /) and matches every local account against it. Those
+#   are the accounts whose password unlocks the FileVault disk at startup, whether
+#   or not they hold a Secure Token. That list is published to NinjaOne; stdout
 #   stays the Secure Token list. Volume ownership (the right to authorize macOS
 #   updates and security policy on Apple silicon) cannot be read reliably from
 #   the command line, so it is not reported.
@@ -33,8 +34,8 @@
 #     SECURE_TOKEN_FIELD - NinjaOne custom field to publish the comma-separated
 #                          list to. Default secureTokenUsers. Set to an empty
 #                          string to skip publishing.
-#     UNLOCK_USERS_FIELD - NinjaOne custom field for the token holders that can
-#                          also unlock the disk. Default fileVaultUnlockUsers.
+#     UNLOCK_USERS_FIELD - NinjaOne custom field for the accounts that can unlock
+#                          the disk. Default fileVaultUnlockUsers.
 #                          Set to an empty string to skip publishing.
 # ==============================================================================
 
@@ -72,16 +73,26 @@ fi
 
 printf '%s\n' "${token_users[@]}"
 
-# Token holders whose GeneratedUID is an APFS cryptographic user of the boot volume
+# Every local account whose GeneratedUID is an APFS cryptographic user of the boot
+# volume. Other entries (recovery keys, iCloud) have no local account and are
+# only counted.
 crypto_users=$(diskutil apfs listUsers / 2>/dev/null)
 unlock_users=()
-for u in "${token_users[@]}"; do
-    guid=$(dscl . -read "/Users/$u" GeneratedUID 2>/dev/null | awk '{print $2}')
-    if [[ -n "$guid" && "$crypto_users" == *"$guid"* ]]; then
-        unlock_users+=("$u")
+while read -r name guid; do
+    if [[ -n "$guid" && "$name" != "root" && "$crypto_users" == *"$guid"* ]]; then
+        unlock_users+=("$name")
     fi
-done
+done < <(dscl . -list /Users GeneratedUID 2>/dev/null)
 echo "Can unlock the disk: ${unlock_users[*]:-none}" >&2
+
+# Flag accounts that unlock the disk without a token, or hold a token without
+# being able to unlock the disk.
+for u in "${unlock_users[@]}"; do
+    case " ${token_users[*]} " in *" $u "*) ;; *) echo "Note: $u can unlock the disk but has no Secure Token." >&2 ;; esac
+done
+for u in "${token_users[@]}"; do
+    case " ${unlock_users[*]} " in *" $u "*) ;; *) echo "Note: $u has a Secure Token but cannot unlock the disk." >&2 ;; esac
+done
 
 set_ninja_field() {
     local field="$1"; shift

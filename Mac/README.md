@@ -58,7 +58,7 @@ See [HOWTO.md](../HOWTO.md) for guidance on downloading and running scripts.
 | [Detect MDM Enrollment.sh](Security/Detect%20MDM%20Enrollment.sh) | Reports whether the device is enrolled in an MDM platform |
 | [Get FileVault Key.sh](Security/Get%20FileVault%20Key.sh) | Retrieves the FileVault recovery key for the device |
 | [Get FileVault Status.sh](Security/Get%20FileVault%20Status.sh) | Reports the current FileVault encryption status and publishes it to the diskEncryptionStatus Ninja custom field |
-| [Get Secure Token Users.sh](Security/Get%20Secure%20Token%20Users.sh) | Prints the short name of each local user that holds a Secure Token, one per line and nothing else on stdout, so it can be captured in a variable. Publishes the list to the NinjaOne `secureTokenUsers` field, and the token holders that can also unlock the FileVault disk to `fileVaultUnlockUsers` (override with `SECURE_TOKEN_FIELD` / `UNLOCK_USERS_FIELD`). Exits 1 if no user holds a token |
+| [Get Secure Token Users.sh](Security/Get%20Secure%20Token%20Users.sh) | Prints the short name of each local user that holds a Secure Token, one per line and nothing else on stdout, so it can be captured in a variable. Publishes the list to the NinjaOne `secureTokenUsers` field, and every account that can unlock the FileVault disk (read from the disk's own user list, token or not) to `fileVaultUnlockUsers` (override with `SECURE_TOKEN_FIELD` / `UNLOCK_USERS_FIELD`). Exits 1 if no user holds a token |
 
 ---
 
