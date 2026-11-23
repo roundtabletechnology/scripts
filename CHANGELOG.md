@@ -84,6 +84,14 @@ Finds other MSPs' management agents and remote access tools on a device, because
 - Tested on Windows 11 under PowerShell 7 and 5.1 against a real machine plus planted fake agent folders; the Mac script against a fake filesystem with stubbed `ps` and `pkgutil`. **Not yet run on a real Mac, and the Mac launchd labels and install folders for several vendors are matched on keywords rather than confirmed paths.** Validate against lab installs of the products that matter most.
 - Found while testing: a `^Senso` pattern matched Windows' own `SensorService`, which would have reported Senso.cloud on every machine. Tightened to the product's real names.
 
+## 2026-11-23
+
+### Mac/Security - Get Secure Token Users (new script)
+
+Prints the short name of every local user that holds a Secure Token, one per line, with nothing else on stdout (notes go to stderr), so `token_user=$(./"Get Secure Token Users.sh")` works. It replaces the `dscl ... | sysadminctl -secureTokenStatus` one-liner, whose output names the account's full name ("System Administrator") instead of its short name and lists the DISABLED accounts too. Checks admin group members plus every UID 500+ account, skipping root and `_` service accounts. Exits 1 when no user has a token. Optional `SECURE_TOKEN_FIELD` publishes the comma-separated list to a NinjaOne field.
+
+- Tested with stubbed `dscl`/`sysadminctl` only (no Mac available), covering a token holder, no token holder and variable capture. **Still to confirm on a real Mac.**
+
 ## 2026-10-29
 
 ### Misc - Audit Password Strength (new script)
